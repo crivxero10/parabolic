@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: parabolic
+Version: 1.0.0
+Author: crivero10
+Requires-Python: >=3.14
+Description-Content-Type: text/markdown
+Requires-Dist: pandas
+Requires-Dist: numpy
