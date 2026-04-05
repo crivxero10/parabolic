@@ -66,6 +66,22 @@ class TestBrokerage(unittest.TestCase):
         b = Brokerage(balance=0.0, positions={"SPY":100}, operations=operations)
         assert b.get_total_unrealized_pnl(market_snapshot={"SPY": 600.00}) == 0
 
+    def test_unrealized_pnl_dca(self):
+        asset_name = "SPY"
+        first_opening_price = 650.00
+        second_opening_price = 640.00
+        third_opening_price = 660.00
+        operations = [
+            Operation(operation_type="BUY", asset_name=asset_name, cost_basis=first_opening_price) for _ in range(100)
+        ] + [
+            Operation(operation_type="BUY", asset_name=asset_name, cost_basis=second_opening_price) for _ in range(100)
+        ] + [
+            Operation(operation_type="BUY", asset_name=asset_name, cost_basis=third_opening_price) for _ in range(100)
+        ] 
+        b = Brokerage(balance=0.0, positions={"SPY":100}, operations=operations)
+        assert b.get_total_unrealized_pnl(market_snapshot={"SPY": 650.00}) == 0
+        assert b.get_total_unrealized_pnl(market_snapshot={"SPY": 660.00}) == 1000
+        assert b.get_total_unrealized_pnl(market_snapshot={"SPY": 640.00}) == -1000
 
     def test_unrealized_pnl_multi_asset(self):
         operations = [
@@ -114,7 +130,7 @@ class TestBrokerage(unittest.TestCase):
         unrealized = b.get_total_unrealized_pnl(market_snapshot={"TLT": 95.00, "BIL": 91.00}) 
         assert realized + unrealized == -25040
 
-    def test_realized_pnl_pct(self):
+    def test_realized_pnl_pct_1(self):
         operations = [
             Operation(operation_type="BUY", asset_name="MSFT", cost_basis=350.00) for _ in range(100)
         ] + [
@@ -122,14 +138,32 @@ class TestBrokerage(unittest.TestCase):
         ]
         b = Brokerage(balance=0.0, positions={"MSFT":100}, operations=operations)
 
-        assert b.get_realized_pnl_pct(market_snapshot={"MSFT": 400.00}) == 0.1429
+        assert b.get_realized_pnl_pct(market_snapshot={"MSFT": 400.00}) == 0.1286
 
-    def test_unrealized_pnl_pct(self):
+    def test_realized_pnl_pct_2(self):
+        operations = [
+            Operation(operation_type="BUY", asset_name="MSFT", cost_basis=350.00) for _ in range(100)
+        ]
+        b = Brokerage(balance=0.0, positions={"MSFT":100}, operations=operations)
+
+        assert b.get_realized_pnl_pct(market_snapshot={"MSFT": 400.00}) == 0
+
+    def test_unrealized_pnl_pct_1(self):
         operations = [
             Operation(operation_type="BUY", asset_name="MSFT", cost_basis=350.00) for _ in range(100)
         ]
         b = Brokerage(balance=0.0, positions={"MSFT":100}, operations=operations)
         assert b.get_unrealized_pnl_pct(market_snapshot={"MSFT": 300.00}) == -0.1429
+
+    def test_unrealized_pnl_pct_2(self):
+        operations = [
+            Operation(operation_type="BUY", asset_name="MSFT", cost_basis=350.00) for _ in range(100)
+        ] + [
+            Operation(operation_type="SELL", asset_name="MSFT", cost_basis=395.00) for _ in range(100)
+        ]
+        b = Brokerage(balance=0.0, positions={"MSFT":100}, operations=operations)
+
+        assert b.get_unrealized_pnl_pct(market_snapshot={"MSFT": 400.00}) == 0.0
 
     def test_can_defer_order(self):
         

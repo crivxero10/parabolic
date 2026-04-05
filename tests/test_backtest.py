@@ -126,4 +126,6 @@ class TestBacktest(unittest.TestCase):
                 b.execute(ctx.asset_name, -1 * b.positions[ctx.asset_name], price_now)
 
         assert e.get_rolling_pnl(b, simple_active_strategy_with_stop_loss) == [0.0, 0.0, -405.90, -405.90]  
+
+    
             

@@ -114,7 +114,6 @@ class Brokerage:
         current_market = ctx.market[ctx.t]
         reserved_balance = 0.0
         reserved_positions: dict[str, int] = {}
-
         for instruction in self.deferred_instructions:
             if not self._is_instruction_compatible(
                 instruction.asset_name,
@@ -124,7 +123,6 @@ class Brokerage:
                 reserved_positions,
             ):
                 continue
-            
             should_activate = instruction.activate(ctx)
             if should_activate:
                 if instruction.asset_name in current_market and self.execute(
@@ -140,7 +138,6 @@ class Brokerage:
                     reserved_balance,
                     reserved_positions,
                 )
-
         self.deferred_instructions = remaining_instructions
         return executed_instructions
     
@@ -176,8 +173,7 @@ class Brokerage:
             )
         return reserved_balance
 
-    def get_total_unrealized_pnl(self, market_snapshot: dict[str, float]) -> float:
-        pnl = 0.0
+    def _get_open_inventory(self) -> dict[str, list[float]]:
         inventory: dict[str, list[float]] = {}
         for op in self.operations:
             asset = op.asset_name
@@ -187,6 +183,26 @@ class Brokerage:
             elif op.operation_type == "SELL":
                 if inventory[asset]:
                     inventory[asset].pop(0)
+        return inventory
+
+    def _get_realized_matches(self) -> list[tuple[float, float]]:
+        inventory: dict[str, list[float]] = {}
+        matches: list[tuple[float, float]] = []
+        for op in self.operations:
+            asset = op.asset_name
+            inventory.setdefault(asset, [])
+            if op.operation_type == "BUY":
+                inventory[asset].append(op.cost_basis)
+            elif op.operation_type == "SELL":
+                if not inventory[asset]:
+                    continue
+                buy_cost = inventory[asset].pop(0)
+                matches.append((buy_cost, op.cost_basis))
+        return matches
+
+    def get_total_unrealized_pnl(self, market_snapshot: dict[str, float]) -> float:
+        pnl = 0.0
+        inventory = self._get_open_inventory()
         for asset_name, units in self.positions.items():
             if units <= 0 or asset_name not in market_snapshot:
                 continue
@@ -199,59 +215,27 @@ class Brokerage:
     
     def get_total_realized_pnl(self, market_snapshot: dict[str, float]) -> float:
         pnl = 0.0
-        # FIFO inventory per asset
-        inventory: dict[str, list[float]] = {}
-        for op in self.operations:
-            asset = op.asset_name
-            if asset not in inventory:
-                inventory[asset] = []
-            if op.operation_type == "BUY":
-                inventory[asset].append(op.cost_basis)
-            elif op.operation_type == "SELL":
-                # only realized if there is inventory to match against
-                if not inventory[asset]:
-                    continue
-                buy_cost = inventory[asset].pop(0)
-                pnl += op.cost_basis - buy_cost
+        for buy_cost, sell_cost in self._get_realized_matches():
+            pnl += sell_cost - buy_cost
         return round(pnl, 2)
 
     def get_realized_pnl_pct(self, market_snapshot: dict[str, float]) -> float:
-        inventory: dict[str, list[float]] = {}
-        realized_cost = 0.0
-        realized_pnl = 0.0
-        for op in self.operations:
-            asset = op.asset_name
-            inventory.setdefault(asset, [])
-            if op.operation_type == "BUY":
-                inventory[asset].append(op.cost_basis)
-            elif op.operation_type == "SELL":
-                if not inventory[asset] or asset not in market_snapshot:
-                    continue
-                buy_cost = inventory[asset].pop(0)
-                realized_cost += buy_cost
-                realized_pnl += market_snapshot[asset] - buy_cost
+        realized_cost = sum(buy_cost for buy_cost, _ in self._get_realized_matches())
         if realized_cost == 0:
             return 0.0
+        realized_pnl = self.get_total_realized_pnl(market_snapshot)
         return round(realized_pnl / realized_cost, 4)
 
 
     def get_unrealized_pnl_pct(self, market_snapshot: dict[str, float]) -> float:
-        cost_basis_map: dict[str, list[float]] = {}
-        for op in self.operations:
-            if op.operation_type != "BUY":
-                continue
-        cost_basis_map.setdefault(op.asset_name, []).append(op.cost_basis)
+        inventory = self._get_open_inventory()
         total_cost = 0.0
-        total_pnl = 0.0
         for asset_name, units in self.positions.items():
             if units <= 0 or asset_name not in market_snapshot:
                 continue
-            cost_list = cost_basis_map.get(asset_name, [])
-            if not cost_list:
-                continue
-            avg_cost = sum(cost_list) / len(cost_list)
-            total_cost += units * avg_cost
-            total_pnl += units * (market_snapshot[asset_name] - avg_cost)
+            open_costs = inventory.get(asset_name, [])[:units]
+            total_cost += sum(open_costs)
         if total_cost == 0:
             return 0.0
-        return round(total_pnl / total_cost, 4)
+        unrealized_pnl = self.get_total_unrealized_pnl(market_snapshot)
+        return round(unrealized_pnl / total_cost, 4)
