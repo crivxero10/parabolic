@@ -259,5 +259,21 @@ class TestBrokerage(unittest.TestCase):
         assert b.execute(asset_name="MSFT", units=-10, price=440)
         assert not b.execute(asset_name="MSFT", units=10, price=420)
 
+    def test_cost_average_open_positions(self):
+        b = Brokerage(balance=999999, settled_cash_only=True)
+        assert b.execute(asset_name="MSFT", units=10, price=420)
+        assert b.execute(asset_name="MSFT", units=10, price=440)
+        assert b.execute(asset_name="MSFT", units=30, price=500)
+        assert b.get_avg_cost_basis(asset_name="MSFT") == 472.00
+
+    def test_cost_average_no_positions(self):
+        b = Brokerage(balance=999999, settled_cash_only=True)
+        assert b.execute(asset_name="MSFT", units=10, price=420)
+        assert b.execute(asset_name="MSFT", units=10, price=440)
+        assert b.execute(asset_name="MSFT", units=30, price=500)
+        assert b.get_avg_cost_basis(asset_name="NVDA") == 0
+
+
+
 
 

@@ -186,6 +186,18 @@ class Brokerage:
                     inventory[asset].pop(0)
         return inventory
 
+    def get_avg_cost_basis(self, asset_name: str) -> float:
+        units = self.positions.get(asset_name, 0)
+        if units <= 0:
+            return 0.0
+
+        inventory = self._get_open_inventory()
+        open_costs = inventory.get(asset_name, [])[:units]
+        if not open_costs:
+            return 0.0
+
+        return sum(open_costs) / len(open_costs)
+
     def _get_realized_matches(self) -> list[tuple[float, float]]:
         inventory: dict[str, list[float]] = {}
         matches: list[tuple[float, float]] = []
@@ -247,4 +259,3 @@ class Brokerage:
         self.available_cash += ammount
         
     
-

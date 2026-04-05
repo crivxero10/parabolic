@@ -21,6 +21,12 @@ class SimulationStep:
     def total_pnl(self) -> float:
         return self.realized_pnl + self.unrealized_pnl
 
+    def __repr__(self) -> str:
+        return (
+            f"SimulationStep(t={self.t}, realized_pnl={self.realized_pnl}, "
+            f"unrealized_pnl={self.unrealized_pnl}, total_pnl={self.total_pnl})"
+        )
+
 class Backtester:
     def __init__(
             self,
@@ -45,6 +51,9 @@ class Backtester:
         )
 
     def __iter__(self):
+        if self.simulation_steps:
+            return iter(self.simulation_steps)
+
         brokerage = self._iter_brokerage or self.brokerage
         strategy = self._iter_strategy or self.strategy
         if brokerage is None or strategy is None:

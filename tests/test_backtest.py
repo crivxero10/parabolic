@@ -134,26 +134,28 @@ class TestBacktest(unittest.TestCase):
 
         def simple_dca(ctx: TradingContext):
             price_now = ctx.market[ctx.t][ctx.asset_name]
-            price_before = ctx.market[ctx.t - 1][ctx.asset_name]
-
-            if price_now < price_before:
+            current_dca = b.get_avg_cost_basis(ctx.asset_name)
+            if price_now < current_dca or current_dca == 0:
                 bp = b.available_cash
-                allocation = math.floor(bp / price_now)
+                allocation = math.floor(bp * 0.10 / price_now)
                 if allocation > 0:
                     b.execute(ctx.asset_name, allocation, price_now)
 
         # 4 months of fictional SPY
         SPY = [
-            461.80, 462.72, 462.84, 463.14
+            461.80, 400, 390, 380
         ]
         snapshots = [
             {"SPY": price} for price in SPY
         ]
         spy_backtest = Backtester(snapshots=snapshots, strategy=simple_dca, brokerage=b, asset_name="SPY")
-
         steps = [step for step in spy_backtest]
 
         assert len(steps) == 4
+        assert steps[0].unrealized_pnl == 0
+        assert steps[1].unrealized_pnl == 0
+        assert steps[2].unrealized_pnl == -20.0
+        assert steps[3].unrealized_pnl == -60.0
             
 
 
