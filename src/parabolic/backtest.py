@@ -29,9 +29,13 @@ class Engine:
 
         for t in range(1, len(self.snapshots)):
             ctx = TradingContext(t=t, snapshot=self.snapshots[:t+1], asset_name=self.asset_name)
+            brokerage.execute_all_deferred(ctx)
             strategy(ctx)
             unrealized_pnl = brokerage.get_total_unrealized_pnl(self.snapshots[t])
             realized_pnl = brokerage.get_total_realized_pnl(self.snapshots[t])
+
+            print(brokerage.positions, unrealized_pnl, realized_pnl)
+
             total_pnl = unrealized_pnl + realized_pnl
             pnls.append(total_pnl)
         return pnls

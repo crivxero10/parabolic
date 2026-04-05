@@ -52,6 +52,21 @@ class TestBrokerage(unittest.TestCase):
         b = Brokerage(balance=0.0, positions={"SPY":100}, operations=operations)
         assert b.get_total_unrealized_pnl(market_snapshot={"SPY": 666.66}) == 1666.00
 
+    def test_unrealized_pnl_multiple_operations(self):
+        asset_name = "SPY"
+        opening_price = 650.00
+        closing_price = 600.00
+        operations = [
+            Operation(operation_type="BUY", asset_name=asset_name, cost_basis=opening_price) for _ in range(100)
+        ] + [
+            Operation(operation_type="SELL", asset_name=asset_name, cost_basis=closing_price) for _ in range(100)
+        ] + [
+            Operation(operation_type="BUY", asset_name=asset_name, cost_basis=closing_price) for _ in range(100)
+        ]
+        b = Brokerage(balance=0.0, positions={"SPY":100}, operations=operations)
+        assert b.get_total_unrealized_pnl(market_snapshot={"SPY": 600.00}) == 0
+
+
     def test_unrealized_pnl_multi_asset(self):
         operations = [
             Operation(operation_type="BUY", asset_name="SPY", cost_basis=610.00) for _ in range(100)
@@ -203,3 +218,12 @@ class TestBrokerage(unittest.TestCase):
             TradingContext(1, [{"MSFT": 430.00}, {"MSFT": 440.00}, {"MSFT": 445.00}])
             )) == 0
         assert len(b.deferred_instructions) == 1
+
+    def test_settled_cash_only(self):
+        b = Brokerage(balance=4200, settled_cash_only=True)
+        assert b.execute(asset_name="MSFT", units=10, price=420)
+        assert b.execute(asset_name="MSFT", units=-10, price=440)
+        assert not b.execute(asset_name="MSFT", units=10, price=420)
+
+
+

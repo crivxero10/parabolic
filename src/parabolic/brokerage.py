@@ -37,23 +37,28 @@ class Brokerage:
 
     def __init__(
             self, 
-            balance: float, 
+            balance: float,
+            available_cash: float | None = None,
             positions: dict[str, int] | None = None, 
             operations: list[Operation] | None = None,
-            deferred_instructions: list[Instruction] | None = None):
+            deferred_instructions: list[Instruction] | None = None,
+            settled_cash_only: bool | None = None):
         
         self.balance = balance
+        self.available_cash = balance if available_cash is None else available_cash
         self.positions = positions or {}
         self.operations = operations or []
         self.deferred_instructions = deferred_instructions or []
+        self.settled_cash_only = settled_cash_only or False
 
     def execute(self, asset_name: str, units: int, price: float) -> bool:
         # BUY
         if units > 0:
             total_cost = units * price
-            if total_cost > self.balance:
+            if total_cost > self.available_cash:
                 return False
             self.balance -= total_cost
+            self.available_cash -= total_cost
             if asset_name not in self.positions:
                 self.positions[asset_name] = 0
             self.positions[asset_name] += units
@@ -63,11 +68,14 @@ class Brokerage:
         # SELL
         if units < 0:
             sell_units = abs(units)
+            sale_proceeds = sell_units * price
             # not enough position
             if asset_name not in self.positions or self.positions[asset_name] < sell_units:
                 return False
             self.positions[asset_name] -= sell_units
-            self.balance += sell_units * price
+            self.balance += sale_proceeds
+            if not self.settled_cash_only:
+                self.available_cash += sale_proceeds
             for _ in range(sell_units):
                 self.operations.append(Operation("SELL", asset_name, price))
             return True
@@ -116,8 +124,9 @@ class Brokerage:
                 reserved_positions,
             ):
                 continue
-
-            if instruction.activate(ctx):
+            
+            should_activate = instruction.activate(ctx)
+            if should_activate:
                 if instruction.asset_name in current_market and self.execute(
                     asset_name=instruction.asset_name,
                     units=instruction.units,
@@ -147,7 +156,7 @@ class Brokerage:
             return False
         if units > 0:
             required_balance = units * target_price
-            available_balance = self.balance - reserved_balance
+            available_balance = self.available_cash - reserved_balance
             return required_balance <= available_balance
         required_units = abs(units)
         available_units = self.positions.get(asset_name, 0) - reserved_positions.get(asset_name, 0)
@@ -168,33 +177,24 @@ class Brokerage:
         return reserved_balance
 
     def get_total_unrealized_pnl(self, market_snapshot: dict[str, float]) -> float:
-        # build cost basis per asset from operations
         pnl = 0.0
-        cost_basis_map = {}
+        inventory: dict[str, list[float]] = {}
         for op in self.operations:
-            if op.operation_type != "BUY":
-                continue
-            if op.asset_name not in cost_basis_map:
-                cost_basis_map[op.asset_name] = []
-            cost_basis_map[op.asset_name].append(op.cost_basis)
-
+            asset = op.asset_name
+            inventory.setdefault(asset, [])
+            if op.operation_type == "BUY":
+                inventory[asset].append(op.cost_basis)
+            elif op.operation_type == "SELL":
+                if inventory[asset]:
+                    inventory[asset].pop(0)
         for asset_name, units in self.positions.items():
-            if asset_name not in market_snapshot:
+            if units <= 0 or asset_name not in market_snapshot:
                 continue
-            market_price = market_snapshot[asset_name]
-            # if no operations recorded, assume default cost basis = 0
-            cost_list = cost_basis_map.get(asset_name, [])
-            if cost_list:
-                avg_cost = sum(cost_list) / len(cost_list)
-            else:
-                avg_cost = 0.0
-            # derive cost basis from BUY operations
-            cost_list = [
-                op.cost_basis
-                for op in self.operations
-                if op.operation_type == "BUY" and op.asset_name == asset_name
-            ]
-            pnl += units * (market_price - avg_cost)
+            open_costs = inventory.get(asset_name, [])[:units]
+            if not open_costs:
+                continue
+            avg_cost = sum(open_costs) / len(open_costs)
+            pnl += len(open_costs) * (market_snapshot[asset_name] - avg_cost)
         return round(pnl, 2)
     
     def get_total_realized_pnl(self, market_snapshot: dict[str, float]) -> float:
