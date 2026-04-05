@@ -1,5 +1,6 @@
 import unittest
 from parabolic.brokerage import Brokerage, Operation
+from parabolic.backtest import TradingContext
 
 class TestBrokerage(unittest.TestCase):
     
@@ -98,3 +99,107 @@ class TestBrokerage(unittest.TestCase):
         unrealized = b.get_total_unrealized_pnl(market_snapshot={"TLT": 95.00, "BIL": 91.00}) 
         assert realized + unrealized == -25040
 
+    def test_realized_pnl_pct(self):
+        operations = [
+            Operation(operation_type="BUY", asset_name="MSFT", cost_basis=350.00) for _ in range(100)
+        ] + [
+            Operation(operation_type="SELL", asset_name="MSFT", cost_basis=395.00) for _ in range(100)
+        ]
+        b = Brokerage(balance=0.0, positions={"MSFT":100}, operations=operations)
+
+        assert b.get_realized_pnl_pct(market_snapshot={"MSFT": 400.00}) == 0.1429
+
+    def test_unrealized_pnl_pct(self):
+        operations = [
+            Operation(operation_type="BUY", asset_name="MSFT", cost_basis=350.00) for _ in range(100)
+        ]
+        b = Brokerage(balance=0.0, positions={"MSFT":100}, operations=operations)
+        assert b.get_unrealized_pnl_pct(market_snapshot={"MSFT": 300.00}) == -0.1429
+
+    def test_can_defer_order(self):
+        
+        b = Brokerage(balance=10000000.0)
+        assert b.execute(asset_name="MSFT", units=100, price=420.99)
+        stop_loss_target_price = 400.99
+
+        def stop_loss(ctx: TradingContext):
+
+            current_price = ctx.market[ctx.t]["MSFT"] 
+            if current_price <= stop_loss_target_price:
+                return True
+            return False
+
+        assert b.defer(asset_name="MSFT", units=-100, target_price=stop_loss_target_price, activate=stop_loss)
+        assert b.deferred_instructions[0].activate(
+            TradingContext(1, [{"MSFT": 399.00}, {"MSFT": 398.00}, {"MSFT": 399.00}])
+        ) == True
+
+    def test_cannot_defer_order(self):
+        b = Brokerage(balance=10000000.0)
+        stop_loss_target_price = 400.99
+
+        def stop_loss(ctx: TradingContext):
+
+            current_price = ctx.market[ctx.t]["MSFT"] 
+            if current_price <= stop_loss_target_price:
+                return True
+            return False
+
+        assert not b.defer(asset_name="MSFT", units=-100, target_price=stop_loss_target_price, activate=stop_loss)
+
+    def test_execute_all_deferred_success(self):
+        
+        b = Brokerage(balance=10000000.0)
+        assert b.execute(asset_name="MSFT", units=100, price=420.99)
+        stop_loss_target_price = 400.99
+
+        def stop_loss(ctx: TradingContext):
+
+            current_price = ctx.market[ctx.t]["MSFT"] 
+            if current_price <= stop_loss_target_price:
+                return True
+            return False
+
+        assert b.defer(asset_name="MSFT", units=-100, target_price=stop_loss_target_price, activate=stop_loss)
+        assert len(b.execute_all_deferred(
+            TradingContext(1, [{"MSFT": 399.00}, {"MSFT": 398.00}, {"MSFT": 399.00}])
+            )) == 1
+        
+    def test_execute_all_deferred_failure(self):
+        
+        b = Brokerage(balance=10000000.0)
+        assert b.execute(asset_name="MSFT", units=100, price=420.99)
+        stop_loss_target_price = 400.99
+
+        def stop_loss(ctx: TradingContext):
+
+            current_price = ctx.market[ctx.t]["MSFT"] 
+            if current_price <= stop_loss_target_price:
+                return True
+            return False
+
+        assert b.defer(asset_name="MSFT", units=-100, target_price=stop_loss_target_price, activate=stop_loss)
+        assert b.execute(asset_name="MSFT", units=-100, price=stop_loss_target_price)
+        assert len(b.execute_all_deferred(
+            TradingContext(1, [{"MSFT": 399.00}, {"MSFT": 398.00}, {"MSFT": 399.00}])
+            )) == 0
+        assert len(b.deferred_instructions) == 0
+
+    def test_execute_all_deferred_pending(self):
+        
+        b = Brokerage(balance=10000000.0)
+        assert b.execute(asset_name="MSFT", units=100, price=420.99)
+        stop_loss_target_price = 400.99
+
+        def stop_loss(ctx: TradingContext):
+
+            current_price = ctx.market[ctx.t]["MSFT"] 
+            if current_price <= stop_loss_target_price:
+                return True
+            return False
+
+        assert b.defer(asset_name="MSFT", units=-100, target_price=stop_loss_target_price, activate=stop_loss)
+        assert len(b.execute_all_deferred(
+            TradingContext(1, [{"MSFT": 430.00}, {"MSFT": 440.00}, {"MSFT": 445.00}])
+            )) == 0
+        assert len(b.deferred_instructions) == 1

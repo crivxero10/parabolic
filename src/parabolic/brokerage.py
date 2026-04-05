@@ -1,6 +1,11 @@
 from dataclasses import dataclass
+from typing import Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from parabolic.backtest import TradingContext
 
 class Operation:
+
     def __init__(self, operation_type: str, asset_name: str, cost_basis: float):
         self.operation_type = operation_type
         self.asset_name = asset_name
@@ -11,13 +16,37 @@ class Operation:
     
     def __repr__(self):
         return f"{self.operation_type} {self.asset_name} @ {self.cost_basis}"   
+    
+class Instruction:
+
+    def __init__(self, asset_name: str, units: int, target_price: float, activate: Callable[..., bool]):
+        self.asset_name = asset_name
+        self.units = units
+        self.target_price = target_price
+        self.activate = activate
+
+    def __str__(self):
+        side = "BUY" if self.units > 0 else "SELL" if self.units < 0 else "HOLD"
+        return f"{side} {self.asset_name} {abs(self.units)} @ {self.target_price}"
+    
+    def __repr__(self):
+        return self.__str__()
+
 
 class Brokerage:
-    def __init__(self, balance: float, positions: dict[str, int] | None = None, operations: list[Operation] | None = None):
+
+    def __init__(
+            self, 
+            balance: float, 
+            positions: dict[str, int] | None = None, 
+            operations: list[Operation] | None = None,
+            deferred_instructions: list[Instruction] | None = None):
+        
         self.balance = balance
         self.positions = positions or {}
         self.operations = operations or []
-    
+        self.deferred_instructions = deferred_instructions or []
+
     def execute(self, asset_name: str, units: int, price: float) -> bool:
         # BUY
         if units > 0:
@@ -25,33 +54,118 @@ class Brokerage:
             if total_cost > self.balance:
                 return False
             self.balance -= total_cost
-
             if asset_name not in self.positions:
                 self.positions[asset_name] = 0
             self.positions[asset_name] += units
-
             for _ in range(units):
                 self.operations.append(Operation("BUY", asset_name, price))
-
             return True
-
         # SELL
         if units < 0:
             sell_units = abs(units)
-
             # not enough position
             if asset_name not in self.positions or self.positions[asset_name] < sell_units:
                 return False
-
             self.positions[asset_name] -= sell_units
             self.balance += sell_units * price
-
             for _ in range(sell_units):
                 self.operations.append(Operation("SELL", asset_name, price))
-
             return True
-
         return False
+    
+    def defer(self, asset_name: str, units: int, target_price: float, activate: Callable[..., bool]) -> bool:
+        reserved_balance = 0.0
+        reserved_positions: dict[str, int] = {}
+        for instruction in self.deferred_instructions:
+            reserved_balance = self._reserve_instruction(
+                instruction,
+                reserved_balance,
+                reserved_positions,
+            )
+        if not self._is_instruction_compatible(
+            asset_name,
+            units,
+            target_price,
+            reserved_balance,
+            reserved_positions,
+        ):
+            return False
+        self.deferred_instructions.append(
+            Instruction(
+                asset_name=asset_name,
+                units=units,
+                target_price=target_price,
+                activate=activate,
+            )
+        )
+        return True
+    
+    def execute_all_deferred(self, ctx: TradingContext) -> list[Instruction]:
+        executed_instructions: list[Instruction] = []
+        remaining_instructions: list[Instruction] = []
+        current_market = ctx.market[ctx.t]
+        reserved_balance = 0.0
+        reserved_positions: dict[str, int] = {}
+
+        for instruction in self.deferred_instructions:
+            if not self._is_instruction_compatible(
+                instruction.asset_name,
+                instruction.units,
+                instruction.target_price,
+                reserved_balance,
+                reserved_positions,
+            ):
+                continue
+
+            if instruction.activate(ctx):
+                if instruction.asset_name in current_market and self.execute(
+                    asset_name=instruction.asset_name,
+                    units=instruction.units,
+                    price=current_market[instruction.asset_name],
+                ):
+                    executed_instructions.append(instruction)
+            else:
+                remaining_instructions.append(instruction)
+                reserved_balance = self._reserve_instruction(
+                    instruction,
+                    reserved_balance,
+                    reserved_positions,
+                )
+
+        self.deferred_instructions = remaining_instructions
+        return executed_instructions
+    
+    def _is_instruction_compatible(
+        self,
+        asset_name: str,
+        units: int,
+        target_price: float,
+        reserved_balance: float,
+        reserved_positions: dict[str, int],
+    ) -> bool:
+        if units == 0:
+            return False
+        if units > 0:
+            required_balance = units * target_price
+            available_balance = self.balance - reserved_balance
+            return required_balance <= available_balance
+        required_units = abs(units)
+        available_units = self.positions.get(asset_name, 0) - reserved_positions.get(asset_name, 0)
+        return required_units <= available_units
+
+    def _reserve_instruction(
+        self,
+        instruction: Instruction,
+        reserved_balance: float,
+        reserved_positions: dict[str, int],
+    ) -> float:
+        if instruction.units > 0:
+            return reserved_balance + (instruction.units * instruction.target_price)
+        if instruction.units < 0:
+            reserved_positions[instruction.asset_name] = (
+                reserved_positions.get(instruction.asset_name, 0) + abs(instruction.units)
+            )
+        return reserved_balance
 
     def get_total_unrealized_pnl(self, market_snapshot: dict[str, float]) -> float:
         # build cost basis per asset from operations
@@ -67,48 +181,77 @@ class Brokerage:
         for asset_name, units in self.positions.items():
             if asset_name not in market_snapshot:
                 continue
-
             market_price = market_snapshot[asset_name]
-
             # if no operations recorded, assume default cost basis = 0
             cost_list = cost_basis_map.get(asset_name, [])
             if cost_list:
                 avg_cost = sum(cost_list) / len(cost_list)
             else:
                 avg_cost = 0.0
-            
             # derive cost basis from BUY operations
             cost_list = [
                 op.cost_basis
                 for op in self.operations
                 if op.operation_type == "BUY" and op.asset_name == asset_name
             ]
-
             pnl += units * (market_price - avg_cost)
-
         return round(pnl, 2)
     
     def get_total_realized_pnl(self, market_snapshot: dict[str, float]) -> float:
         pnl = 0.0
         # FIFO inventory per asset
         inventory: dict[str, list[float]] = {}
-
         for op in self.operations:
             asset = op.asset_name
-
             if asset not in inventory:
                 inventory[asset] = []
-
             if op.operation_type == "BUY":
                 inventory[asset].append(op.cost_basis)
-
             elif op.operation_type == "SELL":
                 # only realized if there is inventory to match against
                 if not inventory[asset]:
                     continue
-
                 buy_cost = inventory[asset].pop(0)
                 pnl += op.cost_basis - buy_cost
-
         return round(pnl, 2)
 
+    def get_realized_pnl_pct(self, market_snapshot: dict[str, float]) -> float:
+        inventory: dict[str, list[float]] = {}
+        realized_cost = 0.0
+        realized_pnl = 0.0
+        for op in self.operations:
+            asset = op.asset_name
+            inventory.setdefault(asset, [])
+            if op.operation_type == "BUY":
+                inventory[asset].append(op.cost_basis)
+            elif op.operation_type == "SELL":
+                if not inventory[asset] or asset not in market_snapshot:
+                    continue
+                buy_cost = inventory[asset].pop(0)
+                realized_cost += buy_cost
+                realized_pnl += market_snapshot[asset] - buy_cost
+        if realized_cost == 0:
+            return 0.0
+        return round(realized_pnl / realized_cost, 4)
+
+
+    def get_unrealized_pnl_pct(self, market_snapshot: dict[str, float]) -> float:
+        cost_basis_map: dict[str, list[float]] = {}
+        for op in self.operations:
+            if op.operation_type != "BUY":
+                continue
+        cost_basis_map.setdefault(op.asset_name, []).append(op.cost_basis)
+        total_cost = 0.0
+        total_pnl = 0.0
+        for asset_name, units in self.positions.items():
+            if units <= 0 or asset_name not in market_snapshot:
+                continue
+            cost_list = cost_basis_map.get(asset_name, [])
+            if not cost_list:
+                continue
+            avg_cost = sum(cost_list) / len(cost_list)
+            total_cost += units * avg_cost
+            total_pnl += units * (market_snapshot[asset_name] - avg_cost)
+        if total_cost == 0:
+            return 0.0
+        return round(total_pnl / total_cost, 4)
