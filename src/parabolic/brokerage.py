@@ -50,6 +50,7 @@ class Brokerage:
         self.operations = operations or []
         self.deferred_instructions = deferred_instructions or []
         self.settled_cash_only = settled_cash_only or False
+        self.deposit_history = [balance]
 
     def execute(self, asset_name: str, units: int, price: float) -> bool:
         # BUY
@@ -239,3 +240,11 @@ class Brokerage:
             return 0.0
         unrealized_pnl = self.get_total_unrealized_pnl(market_snapshot)
         return round(unrealized_pnl / total_cost, 4)
+    
+    def deposit(self, ammount: float) -> None:
+        self.deposit_history += [ammount]
+        self.balance += ammount
+        self.available_cash += ammount
+        
+    
+
