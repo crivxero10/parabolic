@@ -1,5 +1,6 @@
 import random
 import secrets
+from collections.abc import Sequence
 
 
 class Walker:
@@ -10,6 +11,36 @@ class Walker:
             seed = secrets.randbits(256)
         self._rng = random.Random(seed)
         self.seed = seed
+
+    def choice(self, items: Sequence[float] | Sequence[str] | Sequence[object]):
+        if not items:
+            raise ValueError("items must contain at least one value")
+        return self._rng.choice(list(items))
+
+    def weighted_choice(
+        self,
+        items: Sequence[float] | Sequence[str] | Sequence[object],
+        weights: Sequence[float],
+    ):
+        if not items:
+            raise ValueError("items must contain at least one value")
+        if len(items) != len(weights):
+            raise ValueError("items and weights must be the same length")
+        if any(weight < 0 for weight in weights):
+            raise ValueError("weights cannot be negative")
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            raise ValueError("weights must sum to a positive value")
+        return self._rng.choices(list(items), weights=list(weights), k=1)[0]
+
+    def random(self) -> float:
+        return self._rng.random()
+
+    def uniform(self, a: float, b: float) -> float:
+        return self._rng.uniform(a, b)
+
+    def gauss(self, mu: float, sigma: float) -> float:
+        return self._rng.gauss(mu, sigma)
 
     def walk(self, series: list[float], n: int) -> list[float]:
         if not series:

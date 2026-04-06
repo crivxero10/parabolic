@@ -4,6 +4,7 @@ from .orchestrator import TradingContext, ContextOrchestrator
 from .indicators import Indicators
 from .mdp import MarketDataProvider
 from .classifier import RegimeClassifier, RegimeClassifierConfig
+from .vortex import Vortex, VortexGenerator, VortexRegimeBias, VortexRequest
 from .tuner import Tuner, ParameterRange, TuningResult, AdaptiveSearchConfig
 from .risk import (
     TRADING_DAYS_PER_YEAR,
@@ -26,6 +27,10 @@ __all__ = [
     "MarketDataProvider",
     "RegimeClassifier",
     "RegimeClassifierConfig",
+    "Vortex",
+    "VortexGenerator",
+    "VortexRegimeBias",
+    "VortexRequest",
     "Tuner",
     "ParameterRange",
     "TuningResult",
