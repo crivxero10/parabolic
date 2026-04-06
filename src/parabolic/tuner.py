@@ -38,6 +38,11 @@ class TuningResult:
     calmar: float
     max_drawdown: float
     final_balance: float
+    initial_balance: float | None = None
+    equity_curve: list[dict[str, object]] | None = None
+    daily_pnl_series: list[dict[str, object]] | None = None
+    closed_trades: list[dict[str, object]] | None = None
+    daily_trade_groups: list[dict[str, object]] | None = None
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,155 @@ class Tuner:
     @staticmethod
     def _score_result(result: TuningResult) -> tuple[float, float, float, float]:
         return (result.sharpe, result.sortino, result.calmar, result.final_balance)
+
+    @staticmethod
+    def _extract_date(value: object) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        if "T" in normalized:
+            return normalized.split("T", 1)[0]
+        return normalized[:10] if len(normalized) >= 10 else normalized
+
+    def _normalize_equity_curve(
+        self,
+        equity_curve: object,
+    ) -> list[dict[str, object]] | None:
+        if not isinstance(equity_curve, list):
+            return None
+
+        normalized_curve: list[dict[str, object]] = []
+        for row in equity_curve:
+            if not isinstance(row, dict):
+                continue
+            balance = row.get("balance")
+            timestamp = row.get("timestamp")
+            normalized_row: dict[str, object] = {
+                "timestamp": None if timestamp is None else str(timestamp),
+                "balance": None if balance is None else float(balance),
+            }
+            if "cash" in row and row.get("cash") is not None:
+                normalized_row["cash"] = float(row["cash"])
+            if "position_value" in row and row.get("position_value") is not None:
+                normalized_row["position_value"] = float(row["position_value"])
+            if "equity" in row and row.get("equity") is not None:
+                normalized_row["equity"] = float(row["equity"])
+            normalized_curve.append(normalized_row)
+
+        return normalized_curve or None
+
+    def _build_daily_pnl_series(
+        self,
+        equity_curve: list[dict[str, object]] | None,
+        initial_balance: float | None,
+    ) -> list[dict[str, object]] | None:
+        if not equity_curve or initial_balance is None:
+            return None
+
+        daily_endings: dict[str, dict[str, object]] = {}
+        ordered_dates: list[str] = []
+        for row in equity_curve:
+            date_value = self._extract_date(row.get("timestamp"))
+            if date_value is None:
+                continue
+            if date_value not in daily_endings:
+                ordered_dates.append(date_value)
+            daily_endings[date_value] = row
+
+        if not ordered_dates:
+            return None
+
+        previous_balance = float(initial_balance)
+        daily_pnl_series: list[dict[str, object]] = []
+        for date_value in ordered_dates:
+            ending_row = daily_endings[date_value]
+            balance_value = ending_row.get("equity", ending_row.get("balance"))
+            if balance_value is None:
+                continue
+            ending_balance = float(balance_value)
+            pnl_amount = ending_balance - previous_balance
+            pnl_pct = 0.0 if previous_balance == 0 else pnl_amount / previous_balance
+            daily_pnl_series.append(
+                {
+                    "date": date_value,
+                    "pnl_amount": pnl_amount,
+                    "pnl_pct": pnl_pct,
+                    "ending_balance": ending_balance,
+                }
+            )
+            previous_balance = ending_balance
+
+        return daily_pnl_series or None
+
+    def _normalize_closed_trade(
+        self,
+        trade: object,
+    ) -> dict[str, object] | None:
+        if not isinstance(trade, dict):
+            return None
+
+        normalized_trade: dict[str, object] = {
+            "entry_timestamp": trade.get("entry_timestamp"),
+            "exit_timestamp": trade.get("exit_timestamp"),
+            "asset": trade.get("asset"),
+            "side": trade.get("side"),
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "quantity": trade.get("quantity"),
+            "pnl_pct": trade.get("pnl_pct"),
+            "pnl_amount": trade.get("pnl_amount"),
+            "bars_held": trade.get("bars_held"),
+        }
+        if trade.get("position_id") is not None:
+            normalized_trade["position_id"] = trade.get("position_id")
+        if trade.get("fees") is not None:
+            normalized_trade["fees"] = trade.get("fees")
+        if trade.get("slippage") is not None:
+            normalized_trade["slippage"] = trade.get("slippage")
+        return normalized_trade
+
+    def _group_trades_by_day(
+        self,
+        closed_trades: list[dict[str, object]] | None,
+    ) -> list[dict[str, object]] | None:
+        if not closed_trades:
+            return None
+
+        grouped: dict[str, list[dict[str, object]]] = {}
+        ordered_dates: list[str] = []
+        for trade in closed_trades:
+            date_value = self._extract_date(trade.get("exit_timestamp"))
+            if date_value is None:
+                continue
+            if date_value not in grouped:
+                grouped[date_value] = []
+                ordered_dates.append(date_value)
+            grouped[date_value].append(trade)
+
+        if not ordered_dates:
+            return None
+
+        daily_trade_groups: list[dict[str, object]] = []
+        for date_value in ordered_dates:
+            trades = grouped[date_value]
+            pnl_pcts = [
+                float(trade["pnl_pct"])
+                for trade in trades
+                if trade.get("pnl_pct") is not None
+            ]
+            daily_trade_groups.append(
+                {
+                    "date": date_value,
+                    "trade_count": len(trades),
+                    "best_trade_pnl_pct": max(pnl_pcts) if pnl_pcts else None,
+                    "worst_trade_pnl_pct": min(pnl_pcts) if pnl_pcts else None,
+                    "trades": [dict(trade) for trade in trades],
+                }
+            )
+
+        return daily_trade_groups or None
 
     @staticmethod
     def _format_parameters(parameters: dict[str, Any]) -> str:
@@ -669,6 +823,26 @@ class Tuner:
             return None
 
         metrics = summarize_risk_metrics(returns=returns, equity_curve=equity_curve)
+
+        normalized_equity_curve = self._normalize_equity_curve(getattr(backtester, "equity_curve", None))
+        raw_closed_trades = getattr(backtester, "closed_trades", None)
+        normalized_closed_trades = None
+        if isinstance(raw_closed_trades, list):
+            normalized_closed_trades = [
+                normalized_trade
+                for normalized_trade in (
+                    self._normalize_closed_trade(trade) for trade in raw_closed_trades
+                )
+                if normalized_trade is not None
+            ]
+            if not normalized_closed_trades:
+                normalized_closed_trades = None
+        daily_pnl_series = self._build_daily_pnl_series(
+            normalized_equity_curve,
+            self.initial_balance,
+        )
+        daily_trade_groups = self._group_trades_by_day(normalized_closed_trades)
+
         return TuningResult(
             strategy_name=strategy_name,
             parameters=dict(parameters),
@@ -679,6 +853,11 @@ class Tuner:
             calmar=metrics["calmar"],
             max_drawdown=metrics["max_drawdown"],
             final_balance=balances[-1],
+            initial_balance=self.initial_balance,
+            equity_curve=normalized_equity_curve,
+            daily_pnl_series=daily_pnl_series,
+            closed_trades=normalized_closed_trades,
+            daily_trade_groups=daily_trade_groups,
         )
 
     def adaptive_search(

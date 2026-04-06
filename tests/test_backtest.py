@@ -1,7 +1,7 @@
 import unittest
 from typing import Callable
 import math
-from parabolic.backtest import Backtester
+from parabolic.backtest import Backtester, SimulationStep
 from parabolic.orchestrator import TradingContext
 from parabolic.brokerage import Brokerage, Operation
 
@@ -158,6 +158,290 @@ class TestBacktest(unittest.TestCase):
         assert steps[2].unrealized_pnl == -20.0
         assert steps[3].unrealized_pnl == -60.0
             
+
+
+
+    def test_simulation_steps_capture_equity_snapshot_fields(self):
+        buying_power = 10000.00
+        b = Brokerage(balance=buying_power)
+        snapshots = [
+            {"SPY": 100.0},
+            {"SPY": 100.0},
+            {"SPY": 105.0},
+        ]
+
+        def buy_once(ctx: TradingContext):
+            if ctx.t == 1 and ctx.brokerage.positions.get(ctx.asset_name, 0) == 0:
+                assert ctx.brokerage.execute(
+                    ctx.asset_name,
+                    10,
+                    ctx.market[ctx.t][ctx.asset_name],
+                    timestamp=f"bar-{ctx.t}",
+                )
+
+        backtest = Backtester(snapshots=snapshots, strategy=buy_once, brokerage=b, asset_name="SPY")
+        steps = [step for step in backtest]
+
+        assert len(steps) == 3
+        assert isinstance(steps[0], SimulationStep)
+
+        # The first yielded step is the historical stale step and should not carry reporting artifacts.
+        assert steps[0].timestamp is None
+        assert steps[0].balance is None
+        assert steps[0].cash is None
+        assert steps[0].position_value is None
+        assert steps[0].equity is None
+        assert steps[0].closed_trades == []
+
+        # After buying 10 units at 100, cash drops but equity remains unchanged.
+        assert steps[1].balance == 9000.0
+        assert steps[1].cash == 9000.0
+        assert steps[1].position_value == 1000.0
+        assert steps[1].equity == 10000.0
+        assert steps[1].closed_trades == []
+
+        # Mark-to-market on the next bar should only affect position value and equity.
+        assert steps[2].balance == 9000.0
+        assert steps[2].cash == 9000.0
+        assert steps[2].position_value == 1050.0
+        assert steps[2].equity == 10050.0
+        assert steps[2].closed_trades == []
+
+        # Equity curve should contain one snapshot per simulated bar after the stale step.
+        assert len(backtest.equity_curve) == 2
+        assert backtest.equity_curve[0]["t"] == 1
+        assert backtest.equity_curve[0]["balance"] == 9000.0
+        assert backtest.equity_curve[0]["cash"] == 9000.0
+        assert backtest.equity_curve[0]["position_value"] == 1000.0
+        assert backtest.equity_curve[0]["equity"] == 10000.0
+        assert backtest.equity_curve[1]["t"] == 2
+        assert backtest.equity_curve[1]["balance"] == 9000.0
+        assert backtest.equity_curve[1]["cash"] == 9000.0
+        assert backtest.equity_curve[1]["position_value"] == 1050.0
+        assert backtest.equity_curve[1]["equity"] == 10050.0
+
+    def test_simulation_collects_closed_trades_once_and_on_exit_step(self):
+        buying_power = 10000.00
+        b = Brokerage(balance=buying_power)
+        snapshots = [
+            {"SPY": 100.0},
+            {"SPY": 100.0},
+            {"SPY": 110.0},
+            {"SPY": 110.0},
+        ]
+
+        def round_trip(ctx: TradingContext):
+            price_now = ctx.market[ctx.t][ctx.asset_name]
+            current_units = ctx.brokerage.positions.get(ctx.asset_name, 0)
+            if ctx.t == 1 and current_units == 0:
+                assert ctx.brokerage.execute(ctx.asset_name, 2, price_now, timestamp="entry-bar")
+            elif ctx.t == 2 and current_units > 0:
+                assert ctx.brokerage.execute(ctx.asset_name, -2, price_now, timestamp="exit-bar")
+
+        backtest = Backtester(snapshots=snapshots, strategy=round_trip, brokerage=b, asset_name="SPY")
+        steps = [step for step in backtest]
+
+        # Two logical one-unit positions should be closed exactly once each.
+        assert len(backtest.closed_trades) == 2
+        assert steps[1].closed_trades == []
+        assert len(steps[2].closed_trades) == 2
+        assert steps[3].closed_trades == []
+        assert steps[2].closed_trades == backtest.closed_trades
+
+        seen_position_ids = set()
+        for trade in backtest.closed_trades:
+            assert trade["asset"] == "SPY"
+            assert trade["side"] == "long"
+            assert trade["entry_timestamp"] == "entry-bar"
+            assert trade["exit_timestamp"] == "exit-bar"
+            assert trade["entry_price"] == 100.0
+            assert trade["exit_price"] == 110.0
+            assert trade["quantity"] == 1
+            assert trade["pnl_amount"] == 10.0
+            assert trade["pnl_pct"] == 0.1
+            assert str(trade["position_id"]).startswith("position-")
+            assert trade["position_id"] not in seen_position_ids
+            seen_position_ids.add(trade["position_id"])
+
+    def test_single_snapshot_session_records_equity_and_closed_trades(self):
+        # Start from a consistent state: one existing share bought at 90, with remaining cash 9910.
+        b = Brokerage(balance=9910.0, positions={"SPY": 1})
+        b.operations = [Operation("BUY", "SPY", 90.0, timestamp="entry-bar", units=1, position_id="position-1")]
+        b._rebuild_caches_from_operations()
+        snapshots = [{"SPY": 100.0}]
+
+        def sell_all(ctx: TradingContext):
+            current_units = ctx.brokerage.positions.get(ctx.asset_name, 0)
+            if current_units > 0:
+                assert ctx.brokerage.execute(
+                    ctx.asset_name,
+                    -1 * current_units,
+                    ctx.market[ctx.t][ctx.asset_name],
+                    timestamp="exit-bar",
+                )
+
+        backtest = Backtester(snapshots=snapshots, strategy=sell_all, brokerage=b, asset_name="SPY")
+        steps = backtest._simulate_single_snapshot_session(b, sell_all)
+
+        assert len(steps) == 1
+        step = steps[0]
+        assert step.balance == 10010.0
+        assert step.cash == 10010.0
+        assert step.position_value == 0.0
+        assert step.equity == 10010.0
+        assert len(step.closed_trades) == 1
+        assert len(backtest.closed_trades) == 1
+        assert len(backtest.equity_curve) == 1
+        assert backtest.equity_curve[0]["balance"] == 10010.0
+        assert backtest.equity_curve[0]["cash"] == 10010.0
+        assert backtest.equity_curve[0]["position_value"] == 0.0
+        assert backtest.equity_curve[0]["equity"] == 10010.0
+
+        trade = backtest.closed_trades[0]
+        assert trade["position_id"] == "position-1"
+        assert trade["entry_timestamp"] == "entry-bar"
+        assert trade["exit_timestamp"] == "exit-bar"
+        assert trade["entry_price"] == 90.0
+        assert trade["exit_price"] == 100.0
+        assert trade["pnl_amount"] == 10.0
+        assert trade["pnl_pct"] == (10.0 / 90.0)
+
+    def test_daily_snapshots_group_by_date_and_compute_daily_pnl(self):
+        buying_power = 10000.00
+        b = Brokerage(balance=buying_power)
+        snapshots = [
+            {"SPY": 100.0},
+            {"SPY": 101.0},
+            {"SPY": 103.0},
+        ]
+
+        def buy_once(ctx: TradingContext):
+            if ctx.t == 1 and ctx.brokerage.positions.get(ctx.asset_name, 0) == 0:
+                assert ctx.brokerage.execute(
+                    ctx.asset_name,
+                    10,
+                    ctx.market[ctx.t][ctx.asset_name],
+                    timestamp=f"bar-{ctx.t}",
+                )
+
+        backtest = Backtester(snapshots=snapshots, strategy=buy_once, brokerage=b, asset_name="SPY")
+        backtest.context_orchestrator.raw_bars = [
+            {"t": "2025-01-02T15:59:00Z"},
+            {"t": "2025-01-03T15:59:00Z"},
+            {"t": "2025-01-03T16:00:00Z"},
+        ]
+        [step for step in backtest]
+
+        # Only simulated bars contribute snapshots, and both simulated bars fall on 2025-01-03.
+        assert len(backtest.daily_snapshots) == 1
+        daily_snapshot = backtest.daily_snapshots[0]
+        assert daily_snapshot["date"] == "2025-01-03"
+        assert daily_snapshot["ending_balance"] == 8990.0
+        assert daily_snapshot["ending_cash"] == 8990.0
+        assert daily_snapshot["ending_position_value"] == 1030.0
+        assert daily_snapshot["ending_equity"] == 10020.0
+        # First daily snapshot currently uses starting account balance as its base.
+        assert daily_snapshot["daily_pnl_amount"] == 20.0
+        assert daily_snapshot["daily_pnl_pct"] == 0.002
+
+    def test_simulate_by_day_single_day_daily_summary_matches_obvious_pnl(self):
+        buying_power = 10000.00
+
+        def buy_first_bar(ctx: TradingContext):
+            if ctx.brokerage.positions.get(ctx.asset_name, 0) == 0:
+                assert ctx.brokerage.execute(
+                    ctx.asset_name,
+                    10,
+                    ctx.market[ctx.t][ctx.asset_name],
+                    timestamp=f"bar-{ctx.t}",
+                )
+
+        backtest = Backtester(
+            snapshots=[{"SPY": 100.0}, {"SPY": 110.0}],
+            strategy=buy_first_bar,
+            brokerage=Brokerage(balance=buying_power),
+            asset_name="SPY",
+            timeframe="1Min",
+        )
+        backtest.context_orchestrator.raw_bars = [
+            {"t": "2025-01-02T15:58:00Z"},
+            {"t": "2025-01-02T15:59:00Z"},
+        ]
+
+        session_results = backtest.simulate_by_day(
+            brokerage_factory=lambda: Brokerage(balance=buying_power),
+            carry_state=False,
+        )
+
+        # Both minute bars belong to the same regular trading session date.
+        assert len(session_results) == 1
+        session = session_results[0]
+        assert session.session_date == "2025-01-02"
+
+        # The strategy buys 10 shares at 100 on the first simulated bar and the day ends at 110.
+        # That implies a +100 mark-to-market gain on a 10,000 starting account.
+        assert session.daily_pnl_amount == 100.0
+        assert session.daily_pnl_pct == 0.01
+
+        # simulate_by_day liquidates remaining positions at session end, so the account finishes fully in cash.
+        assert session.end_balance == 10100.0
+        assert session.end_available_cash == 10100.0
+
+        # The session is expanded to a full regular trading day, so assert the meaningful invariant:
+        # the final step reflects the expected mark-to-market end-of-day equity state before liquidation.
+        assert len(session.steps) > 2
+        final_step = session.steps[-1]
+        assert final_step.equity == 10100.0
+        assert final_step.position_value == 1100.0
+        assert final_step.cash == 9000.0
+
+    def test_simulate_by_day_splits_sessions_across_dates(self):
+        buying_power = 10000.00
+
+        def buy_first_bar(ctx: TradingContext):
+            if ctx.brokerage.positions.get(ctx.asset_name, 0) == 0:
+                assert ctx.brokerage.execute(
+                    ctx.asset_name,
+                    10,
+                    ctx.market[ctx.t][ctx.asset_name],
+                    timestamp=f"bar-{ctx.t}",
+                )
+
+        backtest = Backtester(
+            snapshots=[{"SPY": 100.0}, {"SPY": 110.0}],
+            strategy=buy_first_bar,
+            brokerage=Brokerage(balance=buying_power),
+            asset_name="SPY",
+            timeframe="1Min",
+        )
+        backtest.context_orchestrator.raw_bars = [
+            {"t": "2025-01-02T15:59:00Z"},
+            {"t": "2025-01-03T15:59:00Z"},
+        ]
+
+        session_results = backtest.simulate_by_day(
+            brokerage_factory=lambda: Brokerage(balance=buying_power),
+            carry_state=False,
+        )
+
+        # One regular-session minute bar on each date should produce two separate daily sessions.
+        assert len(session_results) == 2
+        assert session_results[0].session_date == "2025-01-02"
+        assert session_results[1].session_date == "2025-01-03"
+
+        # Each split session is expanded to a full regular trading day from a single minute seed bar.
+        # Since the seeded price is constant within each day, there is no intra-session price change.
+        for expected_price, session in zip([100.0, 110.0], session_results):
+            assert len(session.steps) > 1
+            assert session.daily_pnl_amount == 0.0
+            assert session.daily_pnl_pct == 0.0
+            # End-of-session liquidation should restore the account to the starting cash when there is no price change.
+            assert session.end_balance == 10000.0
+            assert session.end_available_cash == 10000.0
+            final_step = session.steps[-1]
+            assert final_step.cash == 9000.0 if expected_price == 100.0 else 8900.0
+            assert final_step.position_value == 10.0 * expected_price
+            assert final_step.equity == 10000.0
 
 
 

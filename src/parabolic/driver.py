@@ -3,13 +3,22 @@ import json
 import logging
 import os
 import sys
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 
+from parabolic.backtest import Backtester
 from parabolic.brokerage import Brokerage
 from parabolic.classifier import RegimeClassifier, RegimeClassifierConfig
 from parabolic.mdp import AlpacaMarketDataProvider, CachedMarketDataProvider
 from parabolic.orchestrator import ContextOrchestrator
-from parabolic.tuner import AdaptiveSearchConfig, ParameterRange, Tuner
+from parabolic.tuner import (
+    AdaptiveSearchConfig,
+    ParameterRange,
+    Tuner,
+    returns_from_equity_curve,
+    summarize_risk_metrics,
+)
 
 TIMEFRAME_MAP = {
     "minute": "1Min",
@@ -264,6 +273,152 @@ def run_regime_tuning(
 
 
 # Inserted function after run_regime_tuning
+
+def _extract_date(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if "T" in normalized:
+        return normalized.split("T", 1)[0]
+    return normalized[:10] if len(normalized) >= 10 else normalized
+
+
+def _normalize_equity_curve(equity_curve: object) -> list[dict[str, object]] | None:
+    if not isinstance(equity_curve, list):
+        return None
+
+    normalized_curve: list[dict[str, object]] = []
+    for row in equity_curve:
+        if not isinstance(row, dict):
+            continue
+        balance = row.get("balance")
+        timestamp = row.get("timestamp")
+        normalized_row: dict[str, object] = {
+            "timestamp": None if timestamp is None else str(timestamp),
+            "balance": None if balance is None else float(balance),
+        }
+        if "cash" in row and row.get("cash") is not None:
+            normalized_row["cash"] = float(row["cash"])
+        if "position_value" in row and row.get("position_value") is not None:
+            normalized_row["position_value"] = float(row["position_value"])
+        if "equity" in row and row.get("equity") is not None:
+            normalized_row["equity"] = float(row["equity"])
+        normalized_curve.append(normalized_row)
+
+    return normalized_curve or None
+
+
+def _build_daily_pnl_series(
+    equity_curve: list[dict[str, object]] | None,
+    initial_balance: float | None,
+) -> list[dict[str, object]] | None:
+    if not equity_curve or initial_balance is None:
+        return None
+
+    daily_endings: dict[str, dict[str, object]] = {}
+    ordered_dates: list[str] = []
+    for row in equity_curve:
+        date_value = _extract_date(row.get("timestamp"))
+        if date_value is None:
+            continue
+        if date_value not in daily_endings:
+            ordered_dates.append(date_value)
+        daily_endings[date_value] = row
+
+    if not ordered_dates:
+        return None
+
+    previous_balance = float(initial_balance)
+    daily_pnl_series: list[dict[str, object]] = []
+    for date_value in ordered_dates:
+        ending_row = daily_endings[date_value]
+        balance_value = ending_row.get("equity", ending_row.get("balance"))
+        if balance_value is None:
+            continue
+        ending_balance = float(balance_value)
+        pnl_amount = ending_balance - previous_balance
+        pnl_pct = 0.0 if previous_balance == 0 else pnl_amount / previous_balance
+        daily_pnl_series.append(
+            {
+                "date": date_value,
+                "pnl_amount": pnl_amount,
+                "pnl_pct": pnl_pct,
+                "ending_balance": ending_balance,
+            }
+        )
+        previous_balance = ending_balance
+
+    return daily_pnl_series or None
+
+
+def _normalize_closed_trade(trade: object) -> dict[str, object] | None:
+    if not isinstance(trade, dict):
+        return None
+
+    normalized_trade: dict[str, object] = {
+        "entry_timestamp": trade.get("entry_timestamp"),
+        "exit_timestamp": trade.get("exit_timestamp"),
+        "asset": trade.get("asset"),
+        "side": trade.get("side"),
+        "entry_price": trade.get("entry_price"),
+        "exit_price": trade.get("exit_price"),
+        "quantity": trade.get("quantity"),
+        "pnl_pct": trade.get("pnl_pct"),
+        "pnl_amount": trade.get("pnl_amount"),
+        "bars_held": trade.get("bars_held"),
+    }
+    if trade.get("position_id") is not None:
+        normalized_trade["position_id"] = trade.get("position_id")
+    if trade.get("fees") is not None:
+        normalized_trade["fees"] = trade.get("fees")
+    if trade.get("slippage") is not None:
+        normalized_trade["slippage"] = trade.get("slippage")
+    return normalized_trade
+
+
+def _group_trades_by_day(
+    closed_trades: list[dict[str, object]] | None,
+) -> list[dict[str, object]] | None:
+    if not closed_trades:
+        return None
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    ordered_dates: list[str] = []
+    for trade in closed_trades:
+        date_value = _extract_date(trade.get("exit_timestamp"))
+        if date_value is None:
+            continue
+        if date_value not in grouped:
+            grouped[date_value] = []
+            ordered_dates.append(date_value)
+        grouped[date_value].append(trade)
+
+    if not ordered_dates:
+        return None
+
+    daily_trade_groups: list[dict[str, object]] = []
+    for date_value in ordered_dates:
+        trades = grouped[date_value]
+        pnl_pcts = [
+            float(trade["pnl_pct"])
+            for trade in trades
+            if trade.get("pnl_pct") is not None
+        ]
+        daily_trade_groups.append(
+            {
+                "date": date_value,
+                "trade_count": len(trades),
+                "best_trade_pnl_pct": max(pnl_pcts) if pnl_pcts else None,
+                "worst_trade_pnl_pct": min(pnl_pcts) if pnl_pcts else None,
+                "trades": [dict(trade) for trade in trades],
+            }
+        )
+
+    return daily_trade_groups or None
+
+
 def evaluate_strategy(
     *,
     symbol: str,
@@ -271,27 +426,157 @@ def evaluate_strategy(
     initial_balance: float,
     strategy_name: str,
     parameters: dict[str, object],
+    start: str,
+    end: str,
+    verbose: bool,
 ) -> dict[str, object]:
     strategy_factory = resolve_strategy_factory(strategy_name)
+    strategy = strategy_factory(parameters)
 
-    def brokerage_factory() -> Brokerage:
-        return Brokerage(balance=initial_balance)
-
-    tuner = Tuner(
+    seed_brokerage = Brokerage(balance=initial_balance)
+    backtester = Backtester(
+        strategy=strategy,
+        brokerage=seed_brokerage,
         asset_name=symbol,
         context_orchestrator=orchestrator,
-        brokerage_factory=brokerage_factory,
-        initial_balance=initial_balance,
-        search_config=AdaptiveSearchConfig(),
+        collect_equity_curve=verbose,
+        collect_closed_trades=verbose,
+        collect_daily_snapshots=True,
     )
-    result = tuner.evaluate(
-        strategy_name=strategy_name,
-        parameters=parameters,
-        strategy_factory=strategy_factory,
+
+    daily_results = backtester.simulate_by_day(
+        brokerage=seed_brokerage,
+        strategy=strategy,
+        brokerage_factory=lambda: Brokerage(balance=initial_balance),
     )
-    if result is None:
+
+    balances = [result.end_balance for result in daily_results]
+    if not balances:
         raise ValueError("Strategy evaluation did not produce a result.")
-    return {
+
+    metric_equity_curve = [initial_balance, *[float(balance) for balance in balances]]
+    returns = returns_from_equity_curve(metric_equity_curve)
+    if not returns:
+        raise ValueError("Strategy evaluation did not produce usable return series.")
+
+    metrics = summarize_risk_metrics(
+        returns=returns,
+        equity_curve=metric_equity_curve,
+    )
+
+    normalized_equity_curve = _normalize_equity_curve(getattr(backtester, "equity_curve", None)) if verbose else None
+    raw_closed_trades = getattr(backtester, "closed_trades", None) if verbose else None
+    normalized_closed_trades = None
+    if isinstance(raw_closed_trades, list):
+        normalized_closed_trades = [
+            normalized_trade
+            for normalized_trade in (
+                _normalize_closed_trade(trade) for trade in raw_closed_trades
+            )
+            if normalized_trade is not None
+        ]
+        if not normalized_closed_trades:
+            normalized_closed_trades = None
+
+    daily_pnl_series = [
+        {
+            "date": result.session_date if result.session_date is not None else str(index + 1),
+            "pnl_amount": result.daily_pnl_amount,
+            "pnl_pct": result.daily_pnl_pct,
+            "ending_balance": result.end_balance,
+        }
+        for index, result in enumerate(daily_results)
+        if result.daily_pnl_pct is not None
+    ] or None
+    daily_trade_groups = _group_trades_by_day(normalized_closed_trades)
+
+    class EvaluationResult:
+        def __init__(self):
+            self.strategy_name = strategy_name
+            self.parameters = dict(parameters)
+            self.sharpe = metrics["sharpe"]
+            self.sortino = metrics["sortino"]
+            self.calmar = metrics["calmar"]
+            self.max_drawdown = metrics["max_drawdown"]
+            self.final_balance = balances[-1]
+            self.initial_balance = initial_balance
+            self.equity_curve = normalized_equity_curve
+            self.daily_pnl_series = daily_pnl_series
+            self.closed_trades = normalized_closed_trades
+            self.daily_trade_groups = daily_trade_groups
+
+    return _build_evaluation_summary(EvaluationResult(), start=start, end=end, verbose=verbose)
+
+
+# Helper functions for evaluation summary
+def _parse_date_like(value: str) -> date:
+    normalized = value.strip()
+    if "T" in normalized:
+        normalized = normalized.split("T", 1)[0]
+    return date.fromisoformat(normalized)
+
+
+def _safe_average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _group_daily_series_to_weeks(daily_pnl_series: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+    grouped: dict[tuple[int, int], list[dict[str, object]]] = defaultdict(list)
+    ordered_keys: list[tuple[int, int]] = []
+    for row in daily_pnl_series:
+        date_value = _parse_date_like(str(row["date"]))
+        iso_year, iso_week, _ = date_value.isocalendar()
+        key = (iso_year, iso_week)
+        if key not in grouped:
+            ordered_keys.append(key)
+        grouped[key].append(row)
+    return [grouped[key] for key in ordered_keys]
+
+
+def _group_daily_series_to_months(daily_pnl_series: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+    grouped: dict[tuple[int, int], list[dict[str, object]]] = defaultdict(list)
+    ordered_keys: list[tuple[int, int]] = []
+    for row in daily_pnl_series:
+        date_value = _parse_date_like(str(row["date"]))
+        key = (date_value.year, date_value.month)
+        if key not in grouped:
+            ordered_keys.append(key)
+        grouped[key].append(row)
+    return [grouped[key] for key in ordered_keys]
+
+
+def _group_daily_series_to_years(daily_pnl_series: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+    grouped: dict[int, list[dict[str, object]]] = defaultdict(list)
+    ordered_keys: list[int] = []
+    for row in daily_pnl_series:
+        date_value = _parse_date_like(str(row["date"]))
+        key = date_value.year
+        if key not in grouped:
+            ordered_keys.append(key)
+        grouped[key].append(row)
+    return [grouped[key] for key in ordered_keys]
+
+
+def _period_is_longer_than_week(start: str, end: str) -> bool:
+    return (_parse_date_like(end) - _parse_date_like(start)).days > 7
+
+
+def _period_is_longer_than_month(start: str, end: str) -> bool:
+    start_date = _parse_date_like(start)
+    end_date = _parse_date_like(end)
+    return (end_date.year, end_date.month) != (start_date.year, start_date.month) and (end_date - start_date).days > 31
+
+
+def _period_is_longer_than_year(start: str, end: str) -> bool:
+    start_date = _parse_date_like(start)
+    end_date = _parse_date_like(end)
+    return end_date.year > start_date.year and (end_date - start_date).days > 366
+
+
+def _build_evaluation_summary(result, start: str, end: str, verbose: bool) -> dict[str, object]:
+    summary: dict[str, object] = {
         "strategy_name": result.strategy_name,
         "parameters": result.parameters,
         "sharpe": result.sharpe,
@@ -300,6 +585,132 @@ def evaluate_strategy(
         "max_drawdown": result.max_drawdown,
         "final_balance": result.final_balance,
     }
+
+    if result.initial_balance is not None and result.initial_balance != 0:
+        summary["pnl_pct_all_time"] = ((result.final_balance / result.initial_balance) - 1.0) * 100.0
+    else:
+        summary["pnl_pct_all_time"] = None
+
+    daily_pnl_series = result.daily_pnl_series
+    if daily_pnl_series:
+        daily_pct_values = [
+            float(row["pnl_pct"]) * 100.0
+            for row in daily_pnl_series
+            if row.get("pnl_pct") is not None
+        ]
+        summary["pnl_pct_daily_average"] = _safe_average(daily_pct_values)
+
+        if _period_is_longer_than_week(start, end):
+            weekly_groups = _group_daily_series_to_weeks(daily_pnl_series)
+            weekly_values = [
+                _safe_average([
+                    float(row["pnl_pct"]) * 100.0
+                    for row in group
+                    if row.get("pnl_pct") is not None
+                ])
+                for group in weekly_groups
+            ]
+            summary["pnl_pct_weekly_average"] = _safe_average(
+                [value for value in weekly_values if value is not None]
+            )
+
+        if _period_is_longer_than_month(start, end):
+            monthly_groups = _group_daily_series_to_months(daily_pnl_series)
+            monthly_values = [
+                _safe_average([
+                    float(row["pnl_pct"]) * 100.0
+                    for row in group
+                    if row.get("pnl_pct") is not None
+                ])
+                for group in monthly_groups
+            ]
+            summary["pnl_pct_monthly_average"] = _safe_average(
+                [value for value in monthly_values if value is not None]
+            )
+
+        if _period_is_longer_than_year(start, end):
+            yearly_groups = _group_daily_series_to_years(daily_pnl_series)
+            yearly_values = [
+                _safe_average([
+                    float(row["pnl_pct"]) * 100.0
+                    for row in group
+                    if row.get("pnl_pct") is not None
+                ])
+                for group in yearly_groups
+            ]
+            summary["pnl_pct_yearly_average"] = _safe_average(
+                [value for value in yearly_values if value is not None]
+            )
+
+        valid_day_rows = [row for row in daily_pnl_series if row.get("pnl_pct") is not None]
+        if valid_day_rows:
+            best_day = max(valid_day_rows, key=lambda row: float(row["pnl_pct"]))
+            worst_day = min(valid_day_rows, key=lambda row: float(row["pnl_pct"]))
+            summary["best_day"] = {
+                "date": best_day["date"],
+                "pnl_pct": float(best_day["pnl_pct"]) * 100.0,
+            }
+            summary["worst_day"] = {
+                "date": worst_day["date"],
+                "pnl_pct": float(worst_day["pnl_pct"]) * 100.0,
+            }
+        else:
+            summary["best_day"] = None
+            summary["worst_day"] = None
+    else:
+        summary["pnl_pct_daily_average"] = None
+        summary["best_day"] = None
+        summary["worst_day"] = None
+        if _period_is_longer_than_week(start, end):
+            summary["pnl_pct_weekly_average"] = None
+        if _period_is_longer_than_month(start, end):
+            summary["pnl_pct_monthly_average"] = None
+        if _period_is_longer_than_year(start, end):
+            summary["pnl_pct_yearly_average"] = None
+
+    if verbose:
+        if result.closed_trades is not None and result.daily_trade_groups is not None:
+            summary["trading_days"] = []
+            for group in result.daily_trade_groups:
+                summary["trading_days"].append(
+                    {
+                        "date": group.get("date"),
+                        "trade_count": group.get("trade_count"),
+                        "best_trade_pnl_pct": (
+                            None
+                            if group.get("best_trade_pnl_pct") is None
+                            else float(group["best_trade_pnl_pct"]) * 100.0
+                        ),
+                        "worst_trade_pnl_pct": (
+                            None
+                            if group.get("worst_trade_pnl_pct") is None
+                            else float(group["worst_trade_pnl_pct"]) * 100.0
+                        ),
+                        "trades": [
+                            {
+                                key: trade.get(key)
+                                for key in (
+                                    "position_id",
+                                    "asset",
+                                    "side",
+                                    "entry_timestamp",
+                                    "exit_timestamp",
+                                    "entry_price",
+                                    "exit_price",
+                                    "quantity",
+                                    "pnl_pct",
+                                    "pnl_amount",
+                                )
+                                if key in trade
+                            }
+                            for trade in group.get("trades", [])
+                        ],
+                    }
+                )
+        else:
+            summary["verbose_data_unavailable"] = True
+
+    return summary
 
 
 
@@ -393,6 +804,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Rolling stop percentage",
     )
+    evaluate_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Include daily and trade-level logs in the evaluate output when available",
+    )
     return parser
 
 
@@ -451,6 +867,9 @@ def main() -> int:
                 initial_balance=args.initial_balance,
                 strategy_name=args.strategy_name,
                 parameters=make_regime_parameters_from_args(args),
+                start=args.start,
+                end=args.end,
+                verbose=args.verbose,
             )
         except ValueError as exc:
             print(str(exc), file=sys.stderr)

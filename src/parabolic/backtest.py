@@ -9,10 +9,27 @@ from parabolic.orchestrator import TradingContext, ContextOrchestrator
 
 class SimulationStep:
 
-    def __init__(self, t: int, realized_pnl: float, unrealized_pnl: float):
+    def __init__(
+        self,
+        t: int,
+        realized_pnl: float,
+        unrealized_pnl: float,
+        timestamp: str | None = None,
+        balance: float | None = None,
+        cash: float | None = None,
+        position_value: float | None = None,
+        equity: float | None = None,
+        closed_trades: list[dict[str, Any]] | None = None,
+    ):
         self.t = t
         self.realized_pnl = realized_pnl
         self.unrealized_pnl = unrealized_pnl
+        self.timestamp = timestamp
+        self.balance = balance
+        self.cash = cash
+        self.position_value = position_value
+        self.equity = equity
+        self.closed_trades = closed_trades or []
 
     @property
     def total_pnl(self) -> float:
@@ -20,8 +37,10 @@ class SimulationStep:
 
     def __repr__(self) -> str:
         return (
-            f"SimulationStep(t={self.t}, realized_pnl={self.realized_pnl}, "
-            f"unrealized_pnl={self.unrealized_pnl}, total_pnl={self.total_pnl})"
+            f"SimulationStep(t={self.t}, timestamp={self.timestamp}, realized_pnl={self.realized_pnl}, "
+            f"unrealized_pnl={self.unrealized_pnl}, total_pnl={self.total_pnl}, balance={self.balance}, "
+            f"cash={self.cash}, position_value={self.position_value}, equity={self.equity}, "
+            f"closed_trades={self.closed_trades})"
         )
 
 
@@ -33,16 +52,21 @@ class DailySimulationResult:
         steps: list[SimulationStep],
         end_balance: float,
         end_available_cash: float,
+        daily_pnl_amount: float | None = None,
+        daily_pnl_pct: float | None = None,
     ):
         self.session_date = session_date
         self.steps = steps
         self.end_balance = end_balance
         self.end_available_cash = end_available_cash
+        self.daily_pnl_amount = daily_pnl_amount
+        self.daily_pnl_pct = daily_pnl_pct
 
     def __repr__(self) -> str:
         return (
             f"DailySimulationResult(session_date={self.session_date}, "
             f"end_balance={self.end_balance}, end_available_cash={self.end_available_cash}, "
+            f"daily_pnl_amount={self.daily_pnl_amount}, daily_pnl_pct={self.daily_pnl_pct}, "
             f"steps={self.steps})"
         )
 
@@ -61,6 +85,9 @@ class Backtester:
         timeframe: str = "1Day",
         adjustment: str = "all",
         feed: str | None = None,
+        collect_equity_curve: bool = True,
+        collect_closed_trades: bool = True,
+        collect_daily_snapshots: bool = True,
     ):
         self.strategy = strategy
         self.brokerage = brokerage
@@ -79,6 +106,13 @@ class Backtester:
         self.simulation_steps: list[SimulationStep] = []
         self._iter_brokerage: Brokerage | None = None
         self._iter_strategy: Callable[[TradingContext], None] | None = None
+        self.equity_curve: list[dict[str, Any]] = []
+        self.closed_trades: list[dict[str, Any]] = []
+        self.daily_snapshots: list[dict[str, Any]] = []
+        self._starting_equity: float | None = None
+        self.collect_equity_curve = collect_equity_curve
+        self.collect_closed_trades = collect_closed_trades
+        self.collect_daily_snapshots = collect_daily_snapshots
 
     def _build_stale_step(self) -> SimulationStep:
         return SimulationStep(
@@ -86,6 +120,151 @@ class Backtester:
             realized_pnl=0.0,
             unrealized_pnl=0.0,
         )
+
+    def _extract_timestamp(self, t: int) -> str | None:
+        raw_bars = getattr(self.context_orchestrator, "raw_bars", None)
+        if raw_bars and 0 <= t < len(raw_bars):
+            timestamp = raw_bars[t].get("t")
+            return None if timestamp is None else str(timestamp)
+        return None
+
+    def _compute_position_value(self, market_snapshot: dict[str, float], brokerage: Brokerage) -> float:
+        position_value = 0.0
+        for asset_name, units in brokerage.positions.items():
+            if units <= 0:
+                continue
+            if asset_name not in market_snapshot:
+                continue
+            position_value += float(units) * float(market_snapshot[asset_name])
+        return position_value
+
+    def _compute_total_equity(self, market_snapshot: dict[str, float], brokerage: Brokerage) -> float:
+        cash = float(getattr(brokerage, "available_cash", brokerage.balance))
+        position_value = self._compute_position_value(market_snapshot, brokerage)
+        return cash + position_value
+
+    def _record_equity_snapshot(
+        self,
+        *,
+        t: int,
+        brokerage: Brokerage,
+        market_snapshot: dict[str, float],
+    ) -> dict[str, Any]:
+        timestamp = self._extract_timestamp(t)
+        balance = float(brokerage.balance)
+        cash = float(getattr(brokerage, "available_cash", brokerage.balance))
+        position_value = self._compute_position_value(market_snapshot, brokerage)
+        equity = cash + position_value
+        snapshot = {
+            "t": t,
+            "timestamp": timestamp,
+            "balance": balance,
+            "cash": cash,
+            "position_value": position_value,
+            "equity": equity,
+        }
+        if self.collect_equity_curve or self.collect_daily_snapshots:
+            self.equity_curve.append(snapshot)
+        return snapshot
+
+    def _record_closed_trade(self, trade: dict[str, Any]) -> None:
+        if self.collect_closed_trades:
+            self.closed_trades.append(dict(trade))
+
+    def _collect_new_closed_trades(
+        self,
+        brokerage: Brokerage,
+        closed_trade_cursor: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not self.collect_closed_trades:
+            return [], closed_trade_cursor
+        if not hasattr(brokerage, "get_closed_trades"):
+            return [], closed_trade_cursor
+
+        raw_closed_trades = getattr(brokerage, "_closed_trades", None)
+        if isinstance(raw_closed_trades, list):
+            all_closed_trades = raw_closed_trades
+        else:
+            all_closed_trades = brokerage.get_closed_trades()
+            if not isinstance(all_closed_trades, list):
+                return [], closed_trade_cursor
+
+        if closed_trade_cursor < 0:
+            closed_trade_cursor = 0
+        if closed_trade_cursor > len(all_closed_trades):
+            closed_trade_cursor = len(all_closed_trades)
+
+        new_trades = all_closed_trades[closed_trade_cursor:]
+        next_cursor = len(all_closed_trades)
+
+        collected: list[dict[str, Any]] = []
+        for trade in new_trades:
+            normalized_trade = {
+                "position_id": trade.get("position_id"),
+                "asset": trade.get("asset"),
+                "side": trade.get("side"),
+                "entry_timestamp": trade.get("entry_timestamp"),
+                "exit_timestamp": trade.get("exit_timestamp"),
+                "entry_price": trade.get("entry_price"),
+                "exit_price": trade.get("exit_price"),
+                "quantity": trade.get("quantity"),
+                "pnl_amount": trade.get("pnl_amount"),
+                "pnl_pct": trade.get("pnl_pct"),
+                "bars_held": trade.get("bars_held"),
+                "fees": trade.get("fees"),
+                "slippage": trade.get("slippage"),
+            }
+            self._record_closed_trade(normalized_trade)
+            collected.append(normalized_trade)
+        return collected, next_cursor
+
+    def _build_daily_snapshots(self) -> list[dict[str, Any]]:
+        if not self.collect_daily_snapshots:
+            self.daily_snapshots = []
+            return []
+        if not self.equity_curve:
+            return []
+
+        daily_groups: dict[str, list[dict[str, Any]]] = {}
+        for snapshot in self.equity_curve:
+            timestamp = snapshot.get("timestamp")
+            if not timestamp:
+                continue
+            date_key = str(timestamp)[:10]
+            daily_groups.setdefault(date_key, []).append(snapshot)
+
+        ordered_dates = sorted(daily_groups.keys())
+        daily_snapshots: list[dict[str, Any]] = []
+        previous_equity: float | None = None
+        for date_key in ordered_dates:
+            day_snapshots = daily_groups[date_key]
+            ending_snapshot = day_snapshots[-1]
+            ending_equity = float(ending_snapshot["equity"])
+            if previous_equity is None:
+                base_equity = (
+                    self._starting_equity
+                    if self._starting_equity is not None
+                    else float(ending_snapshot["equity"])
+                )
+                daily_pnl_amount = ending_equity - base_equity
+            else:
+                daily_pnl_amount = ending_equity - previous_equity
+                base_equity = previous_equity
+            daily_pnl_pct = 0.0 if base_equity == 0 else daily_pnl_amount / base_equity
+            daily_snapshots.append(
+                {
+                    "date": date_key,
+                    "ending_balance": float(ending_snapshot["balance"]),
+                    "ending_cash": float(ending_snapshot["cash"]),
+                    "ending_position_value": float(ending_snapshot["position_value"]),
+                    "ending_equity": ending_equity,
+                    "daily_pnl_amount": daily_pnl_amount,
+                    "daily_pnl_pct": daily_pnl_pct,
+                }
+            )
+            previous_equity = ending_equity
+        self.daily_snapshots = daily_snapshots
+        return daily_snapshots
 
     def __iter__(self):
         if self.simulation_steps:
@@ -247,23 +426,32 @@ class Backtester:
         self._iter_strategy = strategy
         self.snapshots = self.context_orchestrator.get_snapshots()
         self.simulation_steps = []
+        self.equity_curve = []
+        self.closed_trades = []
+        self.daily_snapshots = []
+        self._starting_equity = None
 
         if not self.snapshots:
             return
 
+        self._starting_equity = self._compute_total_equity(self.snapshots[0], brokerage)
+        closed_trade_cursor = 0
         stale_step = self._build_stale_step()
         self.simulation_steps.append(stale_step)
         yield stale_step
 
         for t in range(1, len(self.snapshots)):
-            step = self._simulate_step(
+            step, closed_trade_cursor = self._simulate_step(
                 t=t,
                 brokerage=brokerage,
                 strategy=strategy,
+                closed_trade_cursor=closed_trade_cursor,
             )
             step.t = t + 1
             self.simulation_steps.append(step)
             yield step
+
+        self._build_daily_snapshots()
 
     def _build_context(self, t: int, brokerage: Brokerage) -> TradingContext:
         ctx = self.context_orchestrator.build_context(t)
@@ -275,17 +463,36 @@ class Backtester:
         t: int,
         brokerage: Brokerage,
         strategy: Callable[[TradingContext], None],
-    ) -> SimulationStep:
+        closed_trade_cursor: int,
+    ) -> tuple[SimulationStep, int]:
         ctx = self._build_context(t, brokerage)
         brokerage.execute_all_deferred(ctx)
         strategy(ctx)
         market_snapshot = self.snapshots[t]
         realized_pnl = brokerage.get_total_realized_pnl(market_snapshot)
         unrealized_pnl = brokerage.get_total_unrealized_pnl(market_snapshot)
-        return SimulationStep(
+        equity_snapshot = self._record_equity_snapshot(
             t=t,
-            realized_pnl=realized_pnl,
-            unrealized_pnl=unrealized_pnl,
+            brokerage=brokerage,
+            market_snapshot=market_snapshot,
+        )
+        closed_trades, next_closed_trade_cursor = self._collect_new_closed_trades(
+            brokerage,
+            closed_trade_cursor,
+        )
+        return (
+            SimulationStep(
+                t=t,
+                realized_pnl=realized_pnl,
+                unrealized_pnl=unrealized_pnl,
+                timestamp=equity_snapshot["timestamp"],
+                balance=equity_snapshot["balance"],
+                cash=equity_snapshot["cash"],
+                position_value=equity_snapshot["position_value"],
+                equity=equity_snapshot["equity"],
+                closed_trades=closed_trades,
+            ),
+            next_closed_trade_cursor,
         )
 
     def _simulate_single_snapshot_session(
@@ -294,23 +501,45 @@ class Backtester:
         strategy: Callable[[TradingContext], None],
     ) -> list[SimulationStep]:
         self.simulation_steps = []
+        self.equity_curve = []
+        self.closed_trades = []
+        self.daily_snapshots = []
+        self._starting_equity = None
 
         if not self.snapshots:
             return self.simulation_steps
 
+        self._starting_equity = self._compute_total_equity(self.snapshots[0], brokerage)
+        closed_trade_cursor = 0
         ctx = self._build_context(0, brokerage)
         brokerage.execute_all_deferred(ctx)
         strategy(ctx)
         market_snapshot = self.snapshots[0]
         realized_pnl = brokerage.get_total_realized_pnl(market_snapshot)
         unrealized_pnl = brokerage.get_total_unrealized_pnl(market_snapshot)
+        equity_snapshot = self._record_equity_snapshot(
+            t=0,
+            brokerage=brokerage,
+            market_snapshot=market_snapshot,
+        )
+        closed_trades, closed_trade_cursor = self._collect_new_closed_trades(
+            brokerage,
+            closed_trade_cursor,
+        )
         self.simulation_steps.append(
             SimulationStep(
                 t=1,
                 realized_pnl=realized_pnl,
                 unrealized_pnl=unrealized_pnl,
+                timestamp=equity_snapshot["timestamp"],
+                balance=equity_snapshot["balance"],
+                cash=equity_snapshot["cash"],
+                position_value=equity_snapshot["position_value"],
+                equity=equity_snapshot["equity"],
+                closed_trades=closed_trades,
             )
         )
+        self._build_daily_snapshots()
         return self.simulation_steps
 
     def simulate(
@@ -351,6 +580,9 @@ class Backtester:
         strategy = self._resolve_strategy(strategy)
         base_brokerage = self._resolve_brokerage(brokerage)
         session_results: list[DailySimulationResult] = []
+        self.equity_curve = []
+        self.closed_trades = []
+        self.daily_snapshots = []
 
         for session_date, session_orchestrator in self._build_daily_session_orchestrators():
             if carry_state:
@@ -363,6 +595,9 @@ class Backtester:
                 brokerage=session_brokerage,
                 asset_name=self.asset_name,
                 context_orchestrator=session_orchestrator,
+                collect_equity_curve=self.collect_equity_curve,
+                collect_closed_trades=self.collect_closed_trades,
+                collect_daily_snapshots=self.collect_daily_snapshots,
             )
             if len(session_backtester.snapshots) == 1:
                 steps = session_backtester._simulate_single_snapshot_session(session_brokerage, strategy)
@@ -379,8 +614,25 @@ class Backtester:
                     steps=steps,
                     end_balance=session_brokerage.balance,
                     end_available_cash=getattr(session_brokerage, "available_cash", session_brokerage.balance),
+                    daily_pnl_amount=(
+                        session_backtester.daily_snapshots[-1]["daily_pnl_amount"]
+                        if session_backtester.daily_snapshots else None
+                    ),
+                    daily_pnl_pct=(
+                        session_backtester.daily_snapshots[-1]["daily_pnl_pct"]
+                        if session_backtester.daily_snapshots else None
+                    ),
                 )
             )
+            if self.collect_equity_curve and session_backtester.equity_curve:
+                self.equity_curve.extend(session_backtester.equity_curve)
+            if self.collect_closed_trades and session_backtester.closed_trades:
+                self.closed_trades.extend(session_backtester.closed_trades)
+            if self.collect_daily_snapshots and session_backtester.daily_snapshots:
+                self.daily_snapshots.extend(session_backtester.daily_snapshots)
+
+        if self.collect_daily_snapshots and self.daily_snapshots:
+            self.daily_snapshots = sorted(self.daily_snapshots, key=lambda row: str(row.get("date", "")))
 
         return session_results
 

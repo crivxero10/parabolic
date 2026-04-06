@@ -1,29 +1,61 @@
 from collections import deque
-from typing import Callable, TYPE_CHECKING
+from itertools import count
+from typing import Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from parabolic.backtest import TradingContext
 
 class Operation:
 
-    def __init__(self, operation_type: str, asset_name: str, cost_basis: float):
+    def __init__(
+        self,
+        operation_type: str,
+        asset_name: str,
+        cost_basis: float,
+        timestamp: str | None = None,
+        units: int = 1,
+        position_id: str | None = None,
+    ):
         self.operation_type = operation_type
         self.asset_name = asset_name
         self.cost_basis = cost_basis
+        self.timestamp = timestamp
+        self.units = units
+        self.position_id = position_id
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "operation_type": self.operation_type,
+            "asset_name": self.asset_name,
+            "cost_basis": self.cost_basis,
+            "timestamp": self.timestamp,
+            "units": self.units,
+            "position_id": self.position_id,
+        }
 
     def __str__(self):
-        return f"{self.operation_type} {self.asset_name} @ {self.cost_basis}"
+        suffix = f" ts={self.timestamp}" if self.timestamp is not None else ""
+        position = f" position_id={self.position_id}" if self.position_id is not None else ""
+        return f"{self.operation_type} {self.asset_name} {self.units} @ {self.cost_basis}{suffix}{position}"
     
     def __repr__(self):
-        return f"{self.operation_type} {self.asset_name} @ {self.cost_basis}"   
+        return self.__str__()
     
 class Instruction:
 
-    def __init__(self, asset_name: str, units: int, target_price: float, activate: Callable[..., bool]):
+    def __init__(
+        self,
+        asset_name: str,
+        units: int,
+        target_price: float,
+        activate: Callable[..., bool],
+        position_id: str | None = None,
+    ):
         self.asset_name = asset_name
         self.units = units
         self.target_price = target_price
         self.activate = activate
+        self.position_id = position_id
 
     def __str__(self):
         side = "BUY" if self.units > 0 else "SELL" if self.units < 0 else "HOLD"
@@ -54,17 +86,75 @@ class Brokerage:
         self._inventory_lots: dict[str, deque[list[float | int]]] = {}
         self._realized_pnl_total = 0.0
         self._realized_cost_total = 0.0
+        self._position_id_counter = count(1)
+        self._open_positions: dict[str, deque[dict[str, Any]]] = {}
+        self._closed_trades: list[dict[str, Any]] = []
+        self._execution_log: list[dict[str, Any]] = []
         self._rebuild_caches_from_operations()
 
     def _rebuild_caches_from_operations(self) -> None:
         self._inventory_lots = {}
         self._realized_pnl_total = 0.0
         self._realized_cost_total = 0.0
+        self._open_positions = {}
+        self._closed_trades = []
+        self._execution_log = []
+        self._position_id_counter = count(1)
         for op in self.operations:
+            units = max(int(getattr(op, "units", 1)), 1)
+            timestamp = getattr(op, "timestamp", None)
+            position_id = getattr(op, "position_id", None)
             if op.operation_type == "BUY":
-                self._record_buy(op.asset_name, op.cost_basis, 1)
+                self._record_buy(op.asset_name, op.cost_basis, units)
+                self._record_open_position(
+                    asset_name=op.asset_name,
+                    price=op.cost_basis,
+                    units=units,
+                    timestamp=timestamp,
+                    position_id=position_id,
+                )
+                self._record_execution(
+                    operation_type="BUY",
+                    asset_name=op.asset_name,
+                    price=op.cost_basis,
+                    units=units,
+                    timestamp=timestamp,
+                    position_id=position_id,
+                    pnl_amount=0.0,
+                    pnl_pct=0.0,
+                )
             elif op.operation_type == "SELL":
-                self._record_sell(op.asset_name, op.cost_basis, 1)
+                self._record_sell(op.asset_name, op.cost_basis, units)
+                closed_trades = self._record_close_position(
+                    asset_name=op.asset_name,
+                    price=op.cost_basis,
+                    units=units,
+                    timestamp=timestamp,
+                )
+                if closed_trades:
+                    for closed_trade in closed_trades:
+                        self._closed_trades.append(closed_trade)
+                        self._record_execution(
+                            operation_type="SELL",
+                            asset_name=op.asset_name,
+                            price=op.cost_basis,
+                            units=int(closed_trade["quantity"]),
+                            timestamp=timestamp,
+                            position_id=str(closed_trade["position_id"]),
+                            pnl_amount=float(closed_trade["pnl_amount"]),
+                            pnl_pct=float(closed_trade["pnl_pct"]),
+                        )
+                else:
+                    self._record_execution(
+                        operation_type="SELL",
+                        asset_name=op.asset_name,
+                        price=op.cost_basis,
+                        units=units,
+                        timestamp=timestamp,
+                        position_id=position_id,
+                        pnl_amount=0.0,
+                        pnl_pct=0.0,
+                    )
 
     def _record_buy(self, asset_name: str, price: float, units: int) -> None:
         if units <= 0:
@@ -92,13 +182,134 @@ class Brokerage:
             else:
                 lots[0][1] = buy_units
 
-    def _append_operations(self, operation_type: str, asset_name: str, price: float, units: int) -> None:
+    def _next_position_id(self) -> str:
+        return f"position-{next(self._position_id_counter)}"
+
+    def _record_open_position(
+        self,
+        *,
+        asset_name: str,
+        price: float,
+        units: int,
+        timestamp: str | None,
+        position_id: str | None = None,
+    ) -> list[str]:
+        created_position_ids: list[str] = []
+        if units <= 0:
+            return created_position_ids
+        positions = self._open_positions.setdefault(asset_name, deque())
+        for _ in range(units):
+            current_position_id = position_id or self._next_position_id()
+            created_position_ids.append(current_position_id)
+            positions.append(
+                {
+                    "position_id": current_position_id,
+                    "asset": asset_name,
+                    "side": "long",
+                    "entry_timestamp": timestamp,
+                    "entry_price": float(price),
+                    "quantity": 1,
+                    "running_cost_basis": float(price),
+                    "realized_pnl": 0.0,
+                    "entry_operation_type": "BUY",
+                    "bars_held": None,
+                    "fees": None,
+                    "slippage": None,
+                }
+            )
+        return created_position_ids
+
+    def _record_close_position(
+        self,
+        *,
+        asset_name: str,
+        price: float,
+        units: int,
+        timestamp: str | None,
+    ) -> list[dict[str, Any]]:
+        if units <= 0:
+            return []
+        positions = self._open_positions.setdefault(asset_name, deque())
+        closed_trades: list[dict[str, Any]] = []
+        remaining_units = units
+        while remaining_units > 0 and positions:
+            open_position = positions.popleft()
+            quantity = int(open_position["quantity"])
+            entry_price = float(open_position["entry_price"])
+            pnl_amount = float(price) - entry_price
+            pnl_pct = 0.0 if entry_price == 0 else pnl_amount / entry_price
+            closed_trade = {
+                "position_id": str(open_position["position_id"]),
+                "asset": asset_name,
+                "side": str(open_position["side"]),
+                "entry_timestamp": open_position["entry_timestamp"],
+                "exit_timestamp": timestamp,
+                "entry_price": entry_price,
+                "exit_price": float(price),
+                "quantity": quantity,
+                "running_cost_basis": float(open_position["running_cost_basis"]),
+                "realized_pnl": pnl_amount,
+                "pnl_amount": pnl_amount,
+                "pnl_pct": pnl_pct,
+                "bars_held": open_position.get("bars_held"),
+                "fees": open_position.get("fees"),
+                "slippage": open_position.get("slippage"),
+            }
+            closed_trades.append(closed_trade)
+            remaining_units -= quantity
+        return closed_trades
+
+    def _record_execution(
+        self,
+        *,
+        operation_type: str,
+        asset_name: str,
+        price: float,
+        units: int,
+        timestamp: str | None,
+        position_id: str | None,
+        pnl_amount: float,
+        pnl_pct: float,
+    ) -> None:
+        self._execution_log.append(
+            {
+                "operation_type": operation_type,
+                "asset": asset_name,
+                "price": float(price),
+                "units": int(units),
+                "timestamp": timestamp,
+                "position_id": position_id,
+                "pnl_amount": float(pnl_amount),
+                "pnl_pct": float(pnl_pct),
+            }
+        )
+
+    def _append_operations(
+        self,
+        operation_type: str,
+        asset_name: str,
+        price: float,
+        units: int,
+        *,
+        timestamp: str | None = None,
+        position_ids: list[str] | None = None,
+    ) -> None:
         if units <= 0:
             return
-        self.operations.extend(
-            Operation(operation_type, asset_name, price)
-            for _ in range(units)
-        )
+        generated_operations: list[Operation] = []
+        for index in range(units):
+            current_position_id = None if position_ids is None or index >= len(position_ids) else position_ids[index]
+            generated_operations.append(
+                Operation(
+                    operation_type,
+                    asset_name,
+                    price,
+                    timestamp=timestamp,
+                    units=1,
+                    position_id=current_position_id,
+                )
+            )
+        self.operations.extend(generated_operations)
 
     def _get_open_lots_for_position(self, asset_name: str, units: int) -> list[tuple[float, int]]:
         if units <= 0:
@@ -115,7 +326,7 @@ class Brokerage:
                 remaining_units -= matched_units
         return limited_lots
 
-    def execute(self, asset_name: str, units: int, price: float) -> bool:
+    def execute(self, asset_name: str, units: int, price: float, timestamp: str | None = None) -> bool:
         # BUY
         if units > 0:
             total_cost = units * price
@@ -127,7 +338,31 @@ class Brokerage:
                 self.positions[asset_name] = 0
             self.positions[asset_name] += units
             self._record_buy(asset_name, price, units)
-            self._append_operations("BUY", asset_name, price, units)
+            position_ids = self._record_open_position(
+                asset_name=asset_name,
+                price=price,
+                units=units,
+                timestamp=timestamp,
+            )
+            self._append_operations(
+                "BUY",
+                asset_name,
+                price,
+                units,
+                timestamp=timestamp,
+                position_ids=position_ids,
+            )
+            for position_id in position_ids:
+                self._record_execution(
+                    operation_type="BUY",
+                    asset_name=asset_name,
+                    price=price,
+                    units=1,
+                    timestamp=timestamp,
+                    position_id=position_id,
+                    pnl_amount=0.0,
+                    pnl_pct=0.0,
+                )
             return True
         # SELL
         if units < 0:
@@ -136,12 +371,38 @@ class Brokerage:
             # not enough position
             if asset_name not in self.positions or self.positions[asset_name] < sell_units:
                 return False
+            closed_trades = self._record_close_position(
+                asset_name=asset_name,
+                price=price,
+                units=sell_units,
+                timestamp=timestamp,
+            )
             self.positions[asset_name] -= sell_units
             self.balance += sale_proceeds
             if not self.settled_cash_only:
                 self.available_cash += sale_proceeds
             self._record_sell(asset_name, price, sell_units)
-            self._append_operations("SELL", asset_name, price, sell_units)
+            position_ids = [str(trade["position_id"]) for trade in closed_trades]
+            self._append_operations(
+                "SELL",
+                asset_name,
+                price,
+                sell_units,
+                timestamp=timestamp,
+                position_ids=position_ids,
+            )
+            for closed_trade in closed_trades:
+                self._closed_trades.append(closed_trade)
+                self._record_execution(
+                    operation_type="SELL",
+                    asset_name=asset_name,
+                    price=price,
+                    units=int(closed_trade["quantity"]),
+                    timestamp=timestamp,
+                    position_id=str(closed_trade["position_id"]),
+                    pnl_amount=float(closed_trade["pnl_amount"]),
+                    pnl_pct=float(closed_trade["pnl_pct"]),
+                )
             return True
         return False
     
@@ -193,6 +454,7 @@ class Brokerage:
                     asset_name=instruction.asset_name,
                     units=instruction.units,
                     price=current_market[instruction.asset_name],
+                    timestamp=str(ctx.t),
                 ):
                     executed_instructions.append(instruction)
             else:
@@ -204,6 +466,15 @@ class Brokerage:
                 )
         self.deferred_instructions = remaining_instructions
         return executed_instructions
+
+    def get_closed_trades(self) -> list[dict[str, Any]]:
+        return [dict(trade) for trade in self._closed_trades]
+
+    def get_execution_log(self) -> list[dict[str, Any]]:
+        return [dict(entry) for entry in self._execution_log]
+
+    def get_order_log(self) -> list[dict[str, Any]]:
+        return self.get_execution_log()
     
     def _is_instruction_compatible(
         self,
