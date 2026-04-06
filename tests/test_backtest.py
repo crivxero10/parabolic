@@ -1,7 +1,8 @@
 import unittest
 from typing import Callable
 import math
-from parabolic.backtest import Backtester, TradingContext
+from parabolic.backtest import Backtester
+from parabolic.orchestrator import TradingContext
 from parabolic.brokerage import Brokerage, Operation
 
 class TestBacktest(unittest.TestCase):

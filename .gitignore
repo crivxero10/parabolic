@@ -11,3 +11,37 @@ htmlcov/
 venv/
 .env
 .DS_Store
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / local runtime
+*.log
+.cache/
+logging_config.json
+
+# Local data / secrets
+.env
+.env.*
+alpaca_bars.json

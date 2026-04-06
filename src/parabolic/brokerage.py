@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from collections import deque
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -51,6 +51,69 @@ class Brokerage:
         self.deferred_instructions = deferred_instructions or []
         self.settled_cash_only = settled_cash_only or False
         self.deposit_history = [balance]
+        self._inventory_lots: dict[str, deque[list[float | int]]] = {}
+        self._realized_pnl_total = 0.0
+        self._realized_cost_total = 0.0
+        self._rebuild_caches_from_operations()
+
+    def _rebuild_caches_from_operations(self) -> None:
+        self._inventory_lots = {}
+        self._realized_pnl_total = 0.0
+        self._realized_cost_total = 0.0
+        for op in self.operations:
+            if op.operation_type == "BUY":
+                self._record_buy(op.asset_name, op.cost_basis, 1)
+            elif op.operation_type == "SELL":
+                self._record_sell(op.asset_name, op.cost_basis, 1)
+
+    def _record_buy(self, asset_name: str, price: float, units: int) -> None:
+        if units <= 0:
+            return
+        lots = self._inventory_lots.setdefault(asset_name, deque())
+        if lots and lots[-1][0] == price:
+            lots[-1][1] += units
+        else:
+            lots.append([price, units])
+
+    def _record_sell(self, asset_name: str, price: float, units: int) -> None:
+        if units <= 0:
+            return
+        lots = self._inventory_lots.setdefault(asset_name, deque())
+        remaining_units = units
+        while remaining_units > 0 and lots:
+            buy_price, buy_units = lots[0]
+            matched_units = min(remaining_units, int(buy_units))
+            self._realized_pnl_total += matched_units * (price - float(buy_price))
+            self._realized_cost_total += matched_units * float(buy_price)
+            buy_units = int(buy_units) - matched_units
+            remaining_units -= matched_units
+            if buy_units == 0:
+                lots.popleft()
+            else:
+                lots[0][1] = buy_units
+
+    def _append_operations(self, operation_type: str, asset_name: str, price: float, units: int) -> None:
+        if units <= 0:
+            return
+        self.operations.extend(
+            Operation(operation_type, asset_name, price)
+            for _ in range(units)
+        )
+
+    def _get_open_lots_for_position(self, asset_name: str, units: int) -> list[tuple[float, int]]:
+        if units <= 0:
+            return []
+        lots = self._inventory_lots.get(asset_name, deque())
+        remaining_units = units
+        limited_lots: list[tuple[float, int]] = []
+        for buy_price, buy_units in lots:
+            if remaining_units <= 0:
+                break
+            matched_units = min(remaining_units, int(buy_units))
+            if matched_units > 0:
+                limited_lots.append((float(buy_price), matched_units))
+                remaining_units -= matched_units
+        return limited_lots
 
     def execute(self, asset_name: str, units: int, price: float) -> bool:
         # BUY
@@ -63,8 +126,8 @@ class Brokerage:
             if asset_name not in self.positions:
                 self.positions[asset_name] = 0
             self.positions[asset_name] += units
-            for _ in range(units):
-                self.operations.append(Operation("BUY", asset_name, price))
+            self._record_buy(asset_name, price, units)
+            self._append_operations("BUY", asset_name, price, units)
             return True
         # SELL
         if units < 0:
@@ -77,8 +140,8 @@ class Brokerage:
             self.balance += sale_proceeds
             if not self.settled_cash_only:
                 self.available_cash += sale_proceeds
-            for _ in range(sell_units):
-                self.operations.append(Operation("SELL", asset_name, price))
+            self._record_sell(asset_name, price, sell_units)
+            self._append_operations("SELL", asset_name, price, sell_units)
             return True
         return False
     
@@ -176,14 +239,10 @@ class Brokerage:
 
     def _get_open_inventory(self) -> dict[str, list[float]]:
         inventory: dict[str, list[float]] = {}
-        for op in self.operations:
-            asset = op.asset_name
-            inventory.setdefault(asset, [])
-            if op.operation_type == "BUY":
-                inventory[asset].append(op.cost_basis)
-            elif op.operation_type == "SELL":
-                if inventory[asset]:
-                    inventory[asset].pop(0)
+        for asset_name, lots in self._inventory_lots.items():
+            inventory[asset_name] = []
+            for buy_price, buy_units in lots:
+                inventory[asset_name].extend([float(buy_price)] * int(buy_units))
         return inventory
 
     def get_avg_cost_basis(self, asset_name: str) -> float:
@@ -191,63 +250,70 @@ class Brokerage:
         if units <= 0:
             return 0.0
 
-        inventory = self._get_open_inventory()
-        open_costs = inventory.get(asset_name, [])[:units]
-        if not open_costs:
+        open_lots = self._get_open_lots_for_position(asset_name, units)
+        if not open_lots:
             return 0.0
 
-        return sum(open_costs) / len(open_costs)
+        total_units = sum(lot_units for _, lot_units in open_lots)
+        if total_units == 0:
+            return 0.0
+
+        total_cost = sum(price * lot_units for price, lot_units in open_lots)
+        return total_cost / total_units
 
     def _get_realized_matches(self) -> list[tuple[float, float]]:
-        inventory: dict[str, list[float]] = {}
         matches: list[tuple[float, float]] = []
+        inventory: dict[str, deque[list[float | int]]] = {}
         for op in self.operations:
             asset = op.asset_name
-            inventory.setdefault(asset, [])
+            inventory.setdefault(asset, deque())
             if op.operation_type == "BUY":
-                inventory[asset].append(op.cost_basis)
+                lots = inventory[asset]
+                if lots and lots[-1][0] == op.cost_basis:
+                    lots[-1][1] += 1
+                else:
+                    lots.append([op.cost_basis, 1])
             elif op.operation_type == "SELL":
-                if not inventory[asset]:
-                    continue
-                buy_cost = inventory[asset].pop(0)
-                matches.append((buy_cost, op.cost_basis))
+                lots = inventory[asset]
+                remaining_units = 1
+                while remaining_units > 0 and lots:
+                    buy_price, buy_units = lots[0]
+                    matched_units = min(remaining_units, int(buy_units))
+                    matches.extend([(float(buy_price), op.cost_basis)] * matched_units)
+                    buy_units = int(buy_units) - matched_units
+                    remaining_units -= matched_units
+                    if buy_units == 0:
+                        lots.popleft()
+                    else:
+                        lots[0][1] = buy_units
         return matches
 
     def get_total_unrealized_pnl(self, market_snapshot: dict[str, float]) -> float:
         pnl = 0.0
-        inventory = self._get_open_inventory()
         for asset_name, units in self.positions.items():
             if units <= 0 or asset_name not in market_snapshot:
                 continue
-            open_costs = inventory.get(asset_name, [])[:units]
-            if not open_costs:
-                continue
-            avg_cost = sum(open_costs) / len(open_costs)
-            pnl += len(open_costs) * (market_snapshot[asset_name] - avg_cost)
+            for buy_price, lot_units in self._get_open_lots_for_position(asset_name, units):
+                pnl += lot_units * (market_snapshot[asset_name] - buy_price)
         return round(pnl, 2)
     
     def get_total_realized_pnl(self, market_snapshot: dict[str, float]) -> float:
-        pnl = 0.0
-        for buy_cost, sell_cost in self._get_realized_matches():
-            pnl += sell_cost - buy_cost
-        return round(pnl, 2)
+        return round(self._realized_pnl_total, 2)
 
     def get_realized_pnl_pct(self, market_snapshot: dict[str, float]) -> float:
-        realized_cost = sum(buy_cost for buy_cost, _ in self._get_realized_matches())
-        if realized_cost == 0:
+        if self._realized_cost_total == 0:
             return 0.0
         realized_pnl = self.get_total_realized_pnl(market_snapshot)
-        return round(realized_pnl / realized_cost, 4)
+        return round(realized_pnl / self._realized_cost_total, 4)
 
 
     def get_unrealized_pnl_pct(self, market_snapshot: dict[str, float]) -> float:
-        inventory = self._get_open_inventory()
         total_cost = 0.0
         for asset_name, units in self.positions.items():
             if units <= 0 or asset_name not in market_snapshot:
                 continue
-            open_costs = inventory.get(asset_name, [])[:units]
-            total_cost += sum(open_costs)
+            for buy_price, lot_units in self._get_open_lots_for_position(asset_name, units):
+                total_cost += buy_price * lot_units
         if total_cost == 0:
             return 0.0
         unrealized_pnl = self.get_total_unrealized_pnl(market_snapshot)
@@ -257,5 +323,21 @@ class Brokerage:
         self.deposit_history += [ammount]
         self.balance += ammount
         self.available_cash += ammount
+
+    def liquidate(self, market_snapshot: dict[str, float]) -> None:
+        missing_assets = [
+            asset_name
+            for asset_name, units in self.positions.items()
+            if units > 0 and asset_name not in market_snapshot
+        ]
+        if missing_assets:
+            raise ValueError(
+                f"Cannot liquidate positions without market prices for: {', '.join(missing_assets)}"
+            )
+
+        for asset_name, units in list(self.positions.items()):
+            if units <= 0:
+                continue
+            self.execute(asset_name=asset_name, units=-units, price=market_snapshot[asset_name])
         
     

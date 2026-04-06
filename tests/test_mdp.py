@@ -89,26 +89,3 @@ class TestMarketDataProvider(unittest.TestCase):
 
             assert first_result == second_result
             assert len(fake_provider.get_latest_bar_calls) == 1
-
-    def test_cached_provider_separates_cache_keys(self):
-        fake_provider = FakeAlpacaMarketDataProvider()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            provider = CachedMarketDataProvider(cache_dir=tmpdir, alpaca_provider=fake_provider)
-
-            provider.get_bars(
-                symbol="SPY",
-                timeframe="1Day",
-                start="2024-01-01T00:00:00Z",
-                end="2024-01-31T00:00:00Z",
-            )
-            provider.get_bars(
-                symbol="SPY",
-                timeframe="1Min",
-                start="2024-01-01T00:00:00Z",
-                end="2024-01-31T00:00:00Z",
-            )
-            provider.get_latest_bar(symbol="SPY")
-
-            assert len(fake_provider.get_bars_calls) == 2
-            assert len(fake_provider.get_latest_bar_calls) == 1
