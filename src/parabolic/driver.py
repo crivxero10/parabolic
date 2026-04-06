@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from collections import defaultdict
@@ -112,6 +113,8 @@ def make_regime_parameters_from_args(args: argparse.Namespace) -> dict[str, obje
 def resolve_strategy_factory(strategy_name: str):
     if strategy_name == "regime_classifier":
         return make_regime_strategy_factory()
+    if strategy_name == "deterministic_test":
+        return make_deterministic_test_strategy_factory()
     raise ValueError(f"Unsupported strategy name: {strategy_name}")
 
 
@@ -138,6 +141,41 @@ def make_regime_strategy_factory():
         )
         classifier = RegimeClassifier(config)
         return build_regime_strategy(classifier)
+
+    return strategy_factory
+
+
+def make_deterministic_test_strategy_factory():
+    def strategy_factory(parameters: dict[str, object]):
+        del parameters
+
+        def strategy(ctx):
+            current_price = float(ctx.market[ctx.t][ctx.asset_name])
+            current_units = int(ctx.brokerage.positions.get(ctx.asset_name, 0))
+            timestamp = None
+            if getattr(ctx, "bar", None) is not None:
+                timestamp = ctx.bar.get("t")
+
+            if ctx.t == 1 and current_units == 0:
+                units = min(10, math.floor(ctx.brokerage.available_cash / current_price))
+                if units > 0:
+                    ctx.brokerage.execute(
+                        ctx.asset_name,
+                        units,
+                        current_price,
+                        timestamp=timestamp,
+                    )
+                return
+
+            if getattr(ctx, "is_session_end", False) and current_units > 0:
+                ctx.brokerage.execute(
+                    ctx.asset_name,
+                    -current_units,
+                    current_price,
+                    timestamp=timestamp,
+                )
+
+        return strategy
 
     return strategy_factory
 
@@ -605,7 +643,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument(
         "--strategy-name",
         default="regime_classifier",
-        choices=["regime_classifier"],
+        choices=["regime_classifier", "deterministic_test"],
         help="Strategy name to evaluate",
     )
     evaluate_parser.add_argument("--k-st", type=int, required=True, help="Short-term window")
@@ -632,25 +670,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    market_data_provider_override: CachedMarketDataProvider | None = None,
+) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logging_config = configure_logging()
     logger = logging.getLogger(__name__)
 
-    logger.info("step=resolve_credentials")
-    credentials = resolve_credentials(args)
-    if credentials is None:
-        print(
-            "Missing Alpaca credentials. Set --api-key/--api-secret or ALPACA_API_KEY/ALPACA_API_SECRET.",
-            file=sys.stderr,
-        )
-        return 1
-    api_key, api_secret = credentials
+    if market_data_provider_override is None:
+        logger.info("step=resolve_credentials")
+        credentials = resolve_credentials(args)
+        if credentials is None:
+            print(
+                "Missing Alpaca credentials. Set --api-key/--api-secret or ALPACA_API_KEY/ALPACA_API_SECRET.",
+                file=sys.stderr,
+            )
+            return 1
+        api_key, api_secret = credentials
 
-    logger.info("step=build_market_data_provider")
-    provider = build_market_data_provider(args, api_key, api_secret)
+        logger.info("step=build_market_data_provider")
+        provider = build_market_data_provider(args, api_key, api_secret)
+    else:
+        provider = market_data_provider_override
 
     logger.info("step=gather_market_data")
     try:
