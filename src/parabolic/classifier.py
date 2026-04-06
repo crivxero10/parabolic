@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
 import logging
-from logging import NullHandler
 import math
 from typing import Any
 
@@ -9,8 +8,8 @@ from parabolic.orchestrator import TradingContext
 from parabolic.indicators import Indicators
 
 logger = logging.getLogger(__name__)
-logger.addHandler(NullHandler())
-logger.propagate = False
+logger.setLevel(logging.DEBUG)
+logger.propagate = True
 
 Bar = dict[str, Any]
 
