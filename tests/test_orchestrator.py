@@ -132,3 +132,29 @@ class TestOrchestrator(unittest.TestCase):
         daily_orchestrators = orchestrator.split_into_daily_orchestrators()
 
         assert daily_orchestrators == []
+
+    def test_build_context_exposes_market_and_bar_history_for_strategies(self):
+        orchestrator = self._make_orchestrator(
+            raw_bars=[
+                {"t": "2025-01-02T14:30:00Z", "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 1000},
+                {"t": "2025-01-02T14:31:00Z", "o": 100.5, "h": 102.0, "l": 100.0, "c": 101.5, "v": 1100},
+                {"t": "2025-01-02T14:32:00Z", "o": 101.5, "h": 103.0, "l": 101.0, "c": 102.5, "v": 1200},
+            ]
+        )
+        orchestrator._snapshots = [
+            {"SPY": 100.5},
+            {"SPY": 101.5},
+            {"SPY": 102.5},
+        ]
+
+        ctx = orchestrator.build_context(2)
+
+        assert ctx.market == [{"SPY": 100.5}, {"SPY": 101.5}, {"SPY": 102.5}]
+        assert ctx.bar == {"t": "2025-01-02T14:32:00Z", "o": 101.5, "h": 103.0, "l": 101.0, "c": 102.5, "v": 1200}
+        assert ctx.bars == [
+            {"t": "2025-01-02T14:30:00Z", "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.5, "v": 1000},
+            {"t": "2025-01-02T14:31:00Z", "o": 100.5, "h": 102.0, "l": 100.0, "c": 101.5, "v": 1100},
+            {"t": "2025-01-02T14:32:00Z", "o": 101.5, "h": 103.0, "l": 101.0, "c": 102.5, "v": 1200},
+        ]
+        assert ctx.is_session_start is False
+        assert ctx.is_session_end is True

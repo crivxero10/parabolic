@@ -10,6 +10,7 @@ from parabolic.mdp import MarketDataProvider
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "evaluate_fixture.json"
+TUNE_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "tune_fixture.json"
 
 
 class FixtureBackedMarketDataProvider(MarketDataProvider):
@@ -107,3 +108,176 @@ class TestDriverCliEvaluate(unittest.TestCase):
             "pnl_pct": -0.2890359360278612,
         }
         assert str(payload["log_file"]).endswith(".log")
+
+    def test_evaluate_cli_accepts_strategy_from_stdin(self):
+        provider = FixtureBackedMarketDataProvider(FIXTURE_PATH)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        strategy_source = """
+def strategy(ctx):
+    current_price = float(ctx.market[ctx.t][ctx.asset_name])
+    current_units = int(ctx.brokerage.positions.get(ctx.asset_name, 0))
+    timestamp = ctx.bar["t"] if ctx.bar is not None else None
+    if ctx.t == 1 and current_units == 0:
+        units = min(10, int(ctx.brokerage.available_cash // current_price))
+        if units > 0:
+            ctx.brokerage.execute(ctx.asset_name, units, current_price, timestamp=timestamp)
+        return
+    if ctx.is_session_end and current_units > 0:
+        ctx.brokerage.execute(ctx.asset_name, -current_units, current_price, timestamp=timestamp)
+"""
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "evaluate",
+                    "--symbol",
+                    "SPY",
+                    "--start",
+                    "2024-01-08",
+                    "--end",
+                    "2024-01-11",
+                    "--timeframe",
+                    "minute",
+                    "--strategy-stdin",
+                ],
+                market_data_provider_override=provider,
+                stdin_override=strategy_source,
+            )
+
+        assert exit_code == 0
+        assert stderr.getvalue() == ""
+
+        payload = json.loads(stdout.getvalue())
+        assert payload["strategy_name"] == "strategy_stdin"
+        assert payload["parameters"] == {}
+        assert math.isclose(payload["sharpe"], 3.0693868916990183, rel_tol=1e-12)
+        assert math.isclose(payload["final_balance"], 10033.146999999999, rel_tol=1e-12)
+        assert str(payload["log_file"]).endswith(".log")
+
+    def test_evaluate_cli_rejects_disallowed_strategy_source(self):
+        provider = FixtureBackedMarketDataProvider(FIXTURE_PATH)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        strategy_source = """
+def strategy(ctx):
+    while True:
+        pass
+"""
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "evaluate",
+                    "--symbol",
+                    "SPY",
+                    "--start",
+                    "2024-01-08",
+                    "--end",
+                    "2024-01-11",
+                    "--timeframe",
+                    "minute",
+                    "--strategy-stdin",
+                ],
+                market_data_provider_override=provider,
+                stdin_override=strategy_source,
+            )
+
+        assert exit_code == 1
+        assert stderr.getvalue() == ""
+        payload = json.loads(stdout.getvalue())
+        assert payload["error_type"] == "StrategyValidationError"
+        assert payload["phase"] == "strategy_validation"
+        assert "While" in payload["message"]
+
+    def test_evaluate_cli_times_out_long_running_strategy_source(self):
+        provider = FixtureBackedMarketDataProvider(FIXTURE_PATH)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        strategy_source = """
+def strategy(ctx):
+    for _ in range(10 ** 8):
+        pass
+"""
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "evaluate",
+                    "--symbol",
+                    "SPY",
+                    "--start",
+                    "2024-01-08",
+                    "--end",
+                    "2024-01-11",
+                    "--timeframe",
+                    "minute",
+                    "--strategy-stdin",
+                    "--strategy-timeout-seconds",
+                    "0.2",
+                ],
+                market_data_provider_override=provider,
+                stdin_override=strategy_source,
+            )
+
+        assert exit_code == 1
+        assert stderr.getvalue() == ""
+        payload = json.loads(stdout.getvalue())
+        assert payload["error_type"] == "StrategyTimeout"
+        assert payload["phase"] == "strategy_timeout"
+        assert payload["context"]["timeout_seconds"] == 0.2
+
+
+class TestDriverCliTune(unittest.TestCase):
+    def test_tune_cli_returns_known_optimal_parameter_set_for_fixture_backed_provider(self):
+        provider = FixtureBackedMarketDataProvider(TUNE_FIXTURE_PATH)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "tune",
+                    "--symbol",
+                    "SPY",
+                    "--start",
+                    "2024-02-05",
+                    "--end",
+                    "2024-02-08",
+                    "--timeframe",
+                    "minute",
+                    "--strategy-name",
+                    "deterministic_tune",
+                ],
+                market_data_provider_override=provider,
+            )
+
+        assert exit_code == 0
+        assert stderr.getvalue() == ""
+
+        payload = json.loads(stdout.getvalue())
+        expected_parameters = {
+            "k_st": 5,
+            "k_lt": 120,
+            "crab_upper_bound": 1.5,
+        }
+
+        for section_name in (
+            "best_sharpe",
+            "best_sortino",
+            "best_calmar",
+            "best_final_balance",
+            "best_composite",
+        ):
+            assert section_name in payload
+            section = payload[section_name]
+            assert section["strategy_name"] == "deterministic_tune"
+            assert section["parameters"] == expected_parameters
+            assert section["ranks"] == {
+                "sharpe": 1,
+                "sortino": 1,
+                "calmar": 1,
+                "final_balance": 1,
+            }
+
+        assert math.isclose(payload["best_final_balance"]["final_balance"], 12072.136000000002, rel_tol=1e-12)

@@ -13,6 +13,7 @@ from parabolic.brokerage import Brokerage
 from parabolic.classifier import RegimeClassifier, RegimeClassifierConfig
 from parabolic.mdp import AlpacaMarketDataProvider, CachedMarketDataProvider
 from parabolic.orchestrator import ContextOrchestrator
+from parabolic.strategy_runtime import StrategyRuntimeConfig, evaluate_strategy_source
 from parabolic.tuner import (
     AdaptiveSearchConfig,
     ParameterRange,
@@ -32,6 +33,8 @@ DEFAULT_LOGGING_CONFIG = {
     "destination": "file",
     "file_path": ".cache/parabolic.log",
 }
+
+DEFAULT_COMPANION_SYMBOLS = ("SPXL", "SPXS")
 
 
 def configure_logging(config_path: Path = LOGGING_CONFIG_PATH) -> dict:
@@ -98,6 +101,103 @@ def build_regime_strategy(classifier: RegimeClassifier):
     return strategy
 
 
+def strategy_api_spec() -> dict[str, object]:
+    return {
+        "strategy_signature": "def strategy(ctx): ...",
+        "strategy_modes": {
+            "builtin": "--strategy-name",
+            "stdin": "--strategy-stdin",
+        },
+        "ctx_fields": {
+            "t": "Current bar index within the session window",
+            "asset_name": "Primary symbol passed with --symbol",
+            "market": "List of market snapshots up to and including ctx.t",
+            "bar": "Current raw bar dict for the primary symbol",
+            "bars": "Raw primary-symbol bars up to and including ctx.t",
+            "start_date": "Requested start date",
+            "end_date": "Requested end date",
+            "timeframe": "Requested timeframe",
+            "adjustment": "Requested adjustment mode",
+            "feed": "Requested feed",
+            "session_market": "Entire session snapshot list",
+            "session_length": "Total number of snapshots in the session",
+            "is_session_start": "True on the first bar",
+            "is_session_end": "True on the last bar",
+            "brokerage": "Brokerage instance for order placement and portfolio state",
+        },
+        "brokerage_methods": {
+            "execute": "execute(asset_name, units, price, timestamp=None)",
+            "defer": "defer(asset_name, units, target_price, activate, position_id=None)",
+            "liquidate": "liquidate(market_snapshot)",
+            "get_total_pnl": "get_total_pnl(market_snapshot)",
+            "get_avg_cost_basis": "get_avg_cost_basis(asset_name)",
+        },
+        "brokerage_fields": {
+            "balance": "Realized cash balance",
+            "available_cash": "Spendable cash",
+            "positions": "Mapping of asset symbol to units held",
+            "operations": "Executed operation history",
+            "deferred_instructions": "Pending deferred instructions",
+        },
+        "indicator_methods": {
+            "availability": "Indicators is injected into stdin strategy execution and can be used without import",
+            "sma": "sma(series, n)",
+            "ema": "ema(series, alpha)",
+            "ema_window": "ema_window(n, series)",
+            "ema_area_between_curves": "ema_area_between_curves(series, k_st, k_lt, lookback)",
+            "rolling_std": "rolling_std(series, n)",
+            "bollinger_bands": "bollinger_bands(series, n, num_std=2.0)",
+            "rsi": "rsi(series, n=14)",
+            "true_range": "true_range(highs, lows, closes)",
+            "atr": "atr(highs, lows, closes, n=14)",
+            "vwap": "vwap(highs, lows, closes, volumes)",
+            "macd": "macd(series, fast=12, slow=26, signal=9)",
+            "stochastic_oscillator": "stochastic_oscillator(highs, lows, closes, k_period=14, d_period=3)",
+            "williams_r": "williams_r(highs, lows, closes, n=14)",
+            "cci": "cci(highs, lows, closes, n=20)",
+            "mfi": "mfi(highs, lows, closes, volumes, n=14)",
+            "obv": "obv(closes, volumes)",
+        },
+        "market_symbols": {
+            "default_behavior": "If --market-symbols is omitted, the market universe defaults to [--symbol, SPXL, SPXS]",
+            "override_flag": "--market-symbols",
+        },
+        "stdin_guardrails": {
+            "required_shape": "Exactly one top-level function named strategy with signature strategy(ctx)",
+            "disallowed": [
+                "imports",
+                "while loops",
+                "try/except blocks",
+                "with blocks",
+                "dunder attribute access",
+                "dangerous builtin calls",
+            ],
+            "timeout_flag": "--strategy-timeout-seconds",
+        },
+    }
+
+
+def parse_market_symbols(symbol: str, market_symbols_arg: str | None) -> list[str]:
+    if market_symbols_arg is None:
+        requested = [symbol, *DEFAULT_COMPANION_SYMBOLS]
+    else:
+        requested = [part.strip().upper() for part in market_symbols_arg.split(",") if part.strip()]
+        if not requested:
+            raise ValueError("--market-symbols must contain at least one symbol")
+        if symbol not in requested:
+            requested.insert(0, symbol)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in requested:
+        normalized = item.upper()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
 # Inserted functions
 def make_regime_parameters_from_args(args: argparse.Namespace) -> dict[str, object]:
     return {
@@ -110,11 +210,29 @@ def make_regime_parameters_from_args(args: argparse.Namespace) -> dict[str, obje
     }
 
 
+def make_regime_parameters_from_optional_args(args: argparse.Namespace) -> dict[str, object]:
+    required = (
+        "k_st",
+        "k_lt",
+        "lookback",
+        "crab_lower_bound",
+        "crab_upper_bound",
+        "rolling_stop_pct",
+    )
+    missing = [name for name in required if getattr(args, name, None) is None]
+    if missing:
+        normalized = [f"--{name.replace('_', '-')}" for name in missing]
+        raise ValueError(f"Missing required evaluate arguments for built-in strategy mode: {', '.join(normalized)}")
+    return make_regime_parameters_from_args(args)
+
+
 def resolve_strategy_factory(strategy_name: str):
     if strategy_name == "regime_classifier":
         return make_regime_strategy_factory()
     if strategy_name == "deterministic_test":
         return make_deterministic_test_strategy_factory()
+    if strategy_name == "deterministic_tune":
+        return make_deterministic_tune_strategy_factory()
     raise ValueError(f"Unsupported strategy name: {strategy_name}")
 
 
@@ -180,9 +298,86 @@ def make_deterministic_test_strategy_factory():
     return strategy_factory
 
 
+def build_deterministic_tune_parameter_space() -> list[ParameterRange]:
+    return [
+        ParameterRange("k_st", (5, 30, 60)),
+        ParameterRange("k_lt", (80, 120)),
+        ParameterRange("crab_upper_bound", (1.5, 2.0)),
+    ]
+
+
+def make_deterministic_tune_strategy_factory():
+    def strategy_factory(parameters: dict[str, object]):
+        entry_minute = int(parameters["k_st"])
+        units_target = int(parameters["k_lt"])
+        trade_asset = "SPXL" if float(parameters["crab_upper_bound"]) < 1.75 else "SPXS"
+
+        def strategy(ctx):
+            current_units = int(ctx.brokerage.positions.get(trade_asset, 0))
+            current_price = float(ctx.market[ctx.t][trade_asset])
+            timestamp = None
+            if getattr(ctx, "bar", None) is not None:
+                timestamp = ctx.bar.get("t")
+
+            if ctx.t == entry_minute and current_units == 0:
+                units = min(units_target, math.floor(ctx.brokerage.available_cash / current_price))
+                if units > 0:
+                    ctx.brokerage.execute(
+                        trade_asset,
+                        units,
+                        current_price,
+                        timestamp=timestamp,
+                    )
+                return
+
+            if getattr(ctx, "is_session_end", False) and current_units > 0:
+                ctx.brokerage.execute(
+                    trade_asset,
+                    -current_units,
+                    current_price,
+                    timestamp=timestamp,
+                )
+
+        return strategy
+
+    return strategy_factory
+
+
+def resolve_tuning_setup(strategy_name: str) -> tuple[list[ParameterRange], object, AdaptiveSearchConfig]:
+    if strategy_name == "regime_classifier":
+        return (
+            build_regime_parameter_space(),
+            make_regime_strategy_factory(),
+            AdaptiveSearchConfig(
+                initial_samples=12,
+                refinement_rounds=2,
+                top_k=3,
+                random_seed=42,
+            ),
+        )
+
+    if strategy_name == "deterministic_tune":
+        return (
+            build_deterministic_tune_parameter_space(),
+            make_deterministic_tune_strategy_factory(),
+            AdaptiveSearchConfig(
+                initial_samples=12,
+                refinement_rounds=0,
+                top_k=3,
+                random_seed=42,
+                executor_kind="sequential",
+                max_full_search_combinations=100,
+                expand_numeric_parameters=False,
+            ),
+        )
+
+    raise ValueError(f"Unsupported tuning strategy name: {strategy_name}")
+
+
 def gather_market_data(
     provider: CachedMarketDataProvider,
     symbol: str,
+    market_symbols: list[str],
     timeframe: str,
     start: str,
     end: str,
@@ -215,48 +410,41 @@ def gather_market_data(
         last_bar.get("c"),
     )
 
-    logger.info("step=fetch_companion_bars symbol=SPXL timeframe=%s", timeframe)
-    spxl_bars = provider.get_bars(
-        symbol="SPXL",
-        timeframe=timeframe,
-        start=start,
-        end=end,
-        adjustment=adjustment,
-        feed=feed,
-    )
-    if not spxl_bars:
-        raise ValueError("Finished fetching SPXL: no data returned.")
+    companion_symbols = [market_symbol for market_symbol in market_symbols if market_symbol != symbol]
+    companion_prices_by_symbol: dict[str, dict[str, float]] = {}
+    for companion_symbol in companion_symbols:
+        logger.info("step=fetch_companion_bars symbol=%s timeframe=%s", companion_symbol, timeframe)
+        companion_bars = provider.get_bars(
+            symbol=companion_symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            adjustment=adjustment,
+            feed=feed,
+        )
+        if not companion_bars:
+            raise ValueError(f"Finished fetching {companion_symbol}: no data returned.")
+        companion_prices_by_symbol[companion_symbol] = {
+            bar["t"]: float(bar["c"])
+            for bar in companion_bars
+            if "t" in bar and "c" in bar
+        }
 
-    logger.info("step=fetch_companion_bars symbol=SPXS timeframe=%s", timeframe)
-    spxs_bars = provider.get_bars(
-        symbol="SPXS",
-        timeframe=timeframe,
-        start=start,
-        end=end,
-        adjustment=adjustment,
-        feed=feed,
-    )
-    if not spxs_bars:
-        raise ValueError("Finished fetching SPXS: no data returned.")
-
-    logger.info("step=align_market_data primary=%s companions=SPXL,SPXS", symbol)
-    spxl_by_timestamp = {bar["t"]: float(bar["c"]) for bar in spxl_bars if "t" in bar and "c" in bar}
-    spxs_by_timestamp = {bar["t"]: float(bar["c"]) for bar in spxs_bars if "t" in bar and "c" in bar}
+    logger.info("step=align_market_data primary=%s companions=%s", symbol, ",".join(companion_symbols) or "none")
 
     snapshots: list[dict[str, float]] = []
     aligned_raw_bars: list[dict] = []
     for bar in bars:
         timestamp = bar.get("t")
-        if timestamp not in spxl_by_timestamp or timestamp not in spxs_by_timestamp:
+        if timestamp is None:
+            continue
+        if any(timestamp not in prices_by_timestamp for prices_by_timestamp in companion_prices_by_symbol.values()):
             continue
         aligned_raw_bars.append(bar)
-        snapshots.append(
-            {
-                symbol: float(bar["c"]),
-                "SPXL": spxl_by_timestamp[timestamp],
-                "SPXS": spxs_by_timestamp[timestamp],
-            }
-        )
+        snapshot = {symbol: float(bar["c"])}
+        for companion_symbol in companion_symbols:
+            snapshot[companion_symbol] = companion_prices_by_symbol[companion_symbol][timestamp]
+        snapshots.append(snapshot)
 
     if not snapshots:
         raise ValueError("Finished alignment: unable to align market data on timestamps.")
@@ -295,18 +483,12 @@ def build_market_data_provider(args: argparse.Namespace, api_key: str, api_secre
 
 def run_regime_tuning(
     *,
+    strategy_name: str,
     symbol: str,
     orchestrator: ContextOrchestrator,
     initial_balance: float,
 ) -> dict[str, dict[str, object]]:
-    parameter_space = build_regime_parameter_space()
-    strategy_factory = make_regime_strategy_factory()
-    search_config = AdaptiveSearchConfig(
-        initial_samples=12,
-        refinement_rounds=2,
-        top_k=3,
-        random_seed=42,
-    )
+    parameter_space, strategy_factory, search_config = resolve_tuning_setup(strategy_name)
 
     def brokerage_factory() -> Brokerage:
         return Brokerage(balance=initial_balance)
@@ -319,7 +501,7 @@ def run_regime_tuning(
         search_config=search_config,
     )
     results = tuner.adaptive_search(
-        strategy_name="regime_classifier",
+        strategy_name=strategy_name,
         parameter_space=parameter_space,
         strategy_factory=strategy_factory,
     )
@@ -586,6 +768,11 @@ def build_parser() -> argparse.ArgumentParser:
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("--symbol", required=True, help="Ticker symbol, e.g. SPY")
     common_parser.add_argument(
+        "--market-symbols",
+        default=None,
+        help="Comma-separated market universe available to the strategy. Defaults to the primary symbol plus SPXL and SPXS.",
+    )
+    common_parser.add_argument(
         "--start",
         required=True,
         help="Start datetime/date, e.g. 2024-01-01 or 2024-01-01T00:00:00Z",
@@ -634,6 +821,18 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common_parser],
         help="Tune the configuration of a strategy over the requested date range",
     )
+    tune_parser = subparsers.choices["tune"]
+    tune_parser.add_argument(
+        "--strategy-name",
+        default="regime_classifier",
+        choices=["regime_classifier", "deterministic_tune"],
+        help="Strategy name to tune",
+    )
+
+    subparsers.add_parser(
+        "strategy-spec",
+        help="Emit a machine-readable JSON specification for strategy authors",
+    )
 
     evaluate_parser = subparsers.add_parser(
         "evaluate",
@@ -646,25 +845,36 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["regime_classifier", "deterministic_test"],
         help="Strategy name to evaluate",
     )
-    evaluate_parser.add_argument("--k-st", type=int, required=True, help="Short-term window")
-    evaluate_parser.add_argument("--k-lt", type=int, required=True, help="Long-term window")
-    evaluate_parser.add_argument("--lookback", type=int, required=True, help="Lookback window")
+    evaluate_parser.add_argument(
+        "--strategy-stdin",
+        action="store_true",
+        help="Read a Python strategy from stdin. The submitted source must define exactly `def strategy(ctx): ...`",
+    )
+    evaluate_parser.add_argument(
+        "--strategy-timeout-seconds",
+        type=float,
+        default=1000.0,
+        help="Maximum runtime allowed for stdin strategy evaluation before the subprocess is terminated",
+    )
+    evaluate_parser.add_argument("--k-st", type=int, required=False, help="Short-term window")
+    evaluate_parser.add_argument("--k-lt", type=int, required=False, help="Long-term window")
+    evaluate_parser.add_argument("--lookback", type=int, required=False, help="Lookback window")
     evaluate_parser.add_argument(
         "--crab-lower-bound",
         type=float,
-        required=True,
+        required=False,
         help="Lower crab regime bound",
     )
     evaluate_parser.add_argument(
         "--crab-upper-bound",
         type=float,
-        required=True,
+        required=False,
         help="Upper crab regime bound",
     )
     evaluate_parser.add_argument(
         "--rolling-stop-pct",
         type=float,
-        required=True,
+        required=False,
         help="Rolling stop percentage",
     )
     return parser
@@ -674,12 +884,17 @@ def main(
     argv: list[str] | None = None,
     *,
     market_data_provider_override: CachedMarketDataProvider | None = None,
+    stdin_override: str | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     logging_config = configure_logging()
     logger = logging.getLogger(__name__)
+
+    if args.command == "strategy-spec":
+        print(json.dumps(strategy_api_spec(), indent=2))
+        return 0
 
     if market_data_provider_override is None:
         logger.info("step=resolve_credentials")
@@ -697,11 +912,18 @@ def main(
     else:
         provider = market_data_provider_override
 
+    try:
+        market_symbols = parse_market_symbols(args.symbol, getattr(args, "market_symbols", None))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     logger.info("step=gather_market_data")
     try:
         orchestrator = gather_market_data(
             provider=provider,
             symbol=args.symbol,
+            market_symbols=market_symbols,
             timeframe=TIMEFRAME_MAP[args.timeframe],
             start=args.start,
             end=args.end,
@@ -716,6 +938,7 @@ def main(
         logger.info("step=run_regime_tuning")
         try:
             summary = run_regime_tuning(
+                strategy_name=args.strategy_name,
                 symbol=args.symbol,
                 orchestrator=orchestrator,
                 initial_balance=args.initial_balance,
@@ -725,13 +948,28 @@ def main(
             return 1
     elif args.command == "evaluate":
         logger.info("step=evaluate_strategy")
+        if args.strategy_stdin:
+            strategy_source = stdin_override if stdin_override is not None else sys.stdin.read()
+            success, payload, exit_code = evaluate_strategy_source(
+                strategy_source=strategy_source,
+                symbol=args.symbol,
+                raw_bars=list(getattr(orchestrator, "raw_bars", [])),
+                snapshots=orchestrator.get_snapshots(),
+                start=args.start,
+                end=args.end,
+                initial_balance=args.initial_balance,
+                log_file=str(logging_config["file_path"]),
+                config=StrategyRuntimeConfig(timeout_seconds=float(args.strategy_timeout_seconds)),
+            )
+            print(json.dumps(payload, indent=2))
+            return exit_code
         try:
             summary = evaluate_strategy(
                 symbol=args.symbol,
                 orchestrator=orchestrator,
                 initial_balance=args.initial_balance,
                 strategy_name=args.strategy_name,
-                parameters=make_regime_parameters_from_args(args),
+                parameters=make_regime_parameters_from_optional_args(args),
                 start=args.start,
                 end=args.end,
                 log_file=str(logging_config["file_path"]),

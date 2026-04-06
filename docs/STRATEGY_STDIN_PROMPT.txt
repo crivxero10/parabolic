@@ -1,0 +1,493 @@
+Write a Python strategy function for the Parabolic CLI stdin strategy mode.
+
+You are writing code that will be executed directly by the CLI inside a guarded stdin strategy runtime. The CLI will call your function once per bar during an evaluation/backtest run. In the intended workflow this is intraday minute data, so your function is effectively run once per minute bar. Write the strategy with that cadence in mind.
+
+Your output must be ONLY valid Python code and must define EXACTLY one top-level function:
+
+def strategy(ctx):
+    ...
+
+Do not output anything except that Python function.
+
+Hard output rules:
+- Output only valid Python source code.
+- Define exactly one top-level function named `strategy`.
+- The signature must be exactly `def strategy(ctx):`.
+- Do not output markdown.
+- Do not output prose.
+- Do not output comments.
+- Do not output imports.
+- Do not output classes.
+- Do not output top-level constants.
+- Do not output any extra top-level code.
+- Do not output helper functions outside `strategy`.
+
+Runtime validation rules:
+The validator will reject or break on these:
+- imports
+- while loops
+- try/except
+- with blocks
+- async constructs
+- lambda
+- dunder attribute access such as `__class__`, `__dict__`, etc.
+- dangerous builtin calls including:
+  `__import__`, `compile`, `eval`, `exec`, `getattr`, `globals`, `input`, `locals`, `open`, `setattr`, `delattr`, `vars`
+
+Mindset:
+- Write a single efficient bar-by-bar strategy.
+- The function should be safe, deterministic, and reasonably fast.
+- The function should not rely on hidden state, external files, imports, or future data.
+- The function should work with the exact runtime interfaces described below.
+- Prefer simple, explicit logic over clever or fragile logic.
+
+What the runtime is doing:
+- The CLI loads market data first.
+- Then it repeatedly calls `strategy(ctx)` once for each loaded bar.
+- In the normal intraday workflow that means one call per minute bar.
+- Each call receives a context containing the cumulative visible history up to that minute.
+- Your function should behave like live intraday decision logic: at minute `t`, only data through minute `t` is available for decisions.
+- If your code raises an exception, evaluation fails and the CLI returns a structured error.
+- If your code is too slow, the runtime may return a timeout error.
+- If your code succeeds, the CLI returns the normal evaluation JSON summary.
+
+Important lookahead rule:
+- `ctx.market` is safe to use for signals because it contains data only up to the current bar.
+- `ctx.bars` is safe to use for signals because it contains primary-symbol raw bars only up to the current bar.
+- `ctx.session_market` contains the full loaded session, including future bars.
+- Do NOT use `ctx.session_market` to make trading decisions. That would be lookahead bias.
+- If you need the current visible history, use `ctx.market` and `ctx.bars`, not `ctx.session_market`.
+
+Intraday execution assumptions:
+- The intended use case is regular intraday market data on minute cadence.
+- The strategy is evaluated one minute at a time.
+- End-of-session logic should usually be handled with `ctx.is_session_end`.
+- If you want to flatten before the close, do it when `ctx.is_session_end` is true.
+- If your logic needs a warmup such as 20, 50, or 200 bars, remember that on minute data those are 20, 50, or 200 minutes of visible history, not trading days.
+- Be careful not to confuse intraday minute history with daily history.
+
+Core `ctx` interface:
+- `ctx.t`
+  Current bar index.
+  Equivalent current snapshot access:
+  `ctx.market[ctx.t]` and `ctx.market[-1]` refer to the current visible snapshot.
+
+- `ctx.asset_name`
+  The primary symbol passed by the CLI through `--symbol`.
+  Example:
+  if `--symbol SPY` was used, then `ctx.asset_name == "SPY"`.
+
+- `ctx.market`
+  A list of visible market snapshots from the beginning of the loaded session up to and including the current bar.
+  Each element is a dict mapping symbol -> close price float.
+  This is very important:
+  `ctx.market` does NOT contain full OHLCV bars for each symbol.
+  It contains only close-price snapshots by symbol.
+  Example:
+  `ctx.market[-1]["SPY"]` is a float close price.
+  Example valid usage:
+  `closes = [float(row[ctx.asset_name]) for row in ctx.market]`
+
+- `ctx.bar`
+  The current raw bar dict for the primary symbol only.
+  This is where primary-symbol OHLCV fields live.
+  Typical keys include:
+  `t`, `o`, `h`, `l`, `c`, `v`, `vw`, `n`
+  Example:
+  `timestamp = ctx.bar["t"] if ctx.bar is not None else None`
+
+- `ctx.bars`
+  A list of raw primary-symbol bars from the beginning of the loaded session up to and including the current bar.
+  Use this for primary-symbol highs, lows, volumes, VWAP inputs, etc.
+  Example:
+  `highs = [float(bar["h"]) for bar in ctx.bars]`
+
+- `ctx.start_date`
+  Requested CLI start date string.
+
+- `ctx.end_date`
+  Requested CLI end date string.
+
+- `ctx.timeframe`
+  Requested timeframe, usually `"1Min"` internally for stdin intraday evaluation.
+
+- `ctx.adjustment`
+  Requested adjustment mode.
+
+- `ctx.feed`
+  Requested feed.
+
+- `ctx.session_market`
+  Full loaded snapshot sequence for the session.
+  Do not use this for trading signals because it includes future data.
+
+- `ctx.session_length`
+  Total number of bars/snapshots in the loaded session.
+
+- `ctx.is_session_start`
+  True on the first bar.
+
+- `ctx.is_session_end`
+  True on the final bar.
+
+- `ctx.brokerage`
+  Brokerage/account object used to place trades and inspect positions.
+
+How market data actually works:
+- `ctx.market` is your main safe signal source.
+- Every item in `ctx.market` is a dict of symbol -> close price float.
+- Only symbols explicitly loaded by the CLI exist in those snapshots.
+- If the caller used:
+  `--market-symbols SPY,SPXL,SPXS,VIXY`
+  then each snapshot in `ctx.market` should contain those keys.
+- If a symbol was not requested in `--market-symbols`, do not assume it exists.
+- The primary symbol from `--symbol` is always present.
+- You may trade symbols other than `ctx.asset_name` as long as they exist in `ctx.market`.
+  Example:
+  You may use `SPY` as the signal asset and trade `SPXL` / `SPXS`.
+
+Very important data model distinction:
+- `ctx.market`:
+  close prices for all loaded symbols
+- `ctx.bar` and `ctx.bars`:
+  raw OHLCV bars for the primary symbol only
+- You do NOT have raw OHLCV bars for secondary symbols in stdin strategy mode.
+- Therefore:
+  if you want highs/lows/volumes, you can only reliably compute them for the primary symbol using `ctx.bars`.
+
+Good data extraction patterns:
+- Current primary close:
+  `current_price = float(ctx.market[-1][ctx.asset_name])`
+
+- Current close of another loaded symbol:
+  `spxl_price = float(ctx.market[-1]["SPXL"])`
+
+- Primary close series:
+  `closes = [float(row[ctx.asset_name]) for row in ctx.market]`
+
+- Secondary symbol close series:
+  `vixy_closes = [float(row["VIXY"]) for row in ctx.market]`
+
+- Primary highs:
+  `highs = [float(bar["h"]) for bar in ctx.bars]`
+
+- Primary lows:
+  `lows = [float(bar["l"]) for bar in ctx.bars]`
+
+- Primary volumes:
+  `volumes = [float(bar["v"]) for bar in ctx.bars]`
+
+- Current timestamp:
+  `timestamp = ctx.bar["t"] if ctx.bar is not None else None`
+
+Brokerage interface you can use:
+- `ctx.brokerage.balance`
+  Realized cash balance after executed trades.
+
+- `ctx.brokerage.available_cash`
+  Spendable cash.
+  Use this when sizing a buy order.
+
+- `ctx.brokerage.positions`
+  Dict mapping symbol -> integer units currently held.
+  Example:
+  `current_units = int(ctx.brokerage.positions.get("SPXL", 0))`
+
+- `ctx.brokerage.operations`
+  Operation history.
+
+- `ctx.brokerage.deferred_instructions`
+  Pending deferred instructions.
+
+Useful brokerage methods:
+- `ctx.brokerage.execute(asset_name, units, price, timestamp=None) -> bool`
+  Immediate order execution.
+  Positive `units` buys.
+  Negative `units` sells.
+  Returns `True` on success, `False` on failure.
+
+  Failure cases include:
+  - not enough `available_cash` for a buy
+  - trying to sell more units than currently held
+  - zero units
+
+  Important:
+  - This brokerage does not support opening naked shorts by selling units you do not own.
+  - Selling more than your current position fails.
+  - If you want to rotate from one asset to another, first flatten the old one, then buy the new one.
+
+- `ctx.brokerage.defer(asset_name, units, target_price, activate)`
+  Queues a deferred instruction.
+  This is harder to use safely in stdin strategy mode because helper functions and lambda are constrained.
+  Prefer `execute(...)` unless you explicitly need deferred orders.
+
+- `ctx.brokerage.liquidate(market_snapshot)`
+  Liquidates all long positions using prices from a snapshot.
+  This can raise if any held asset is missing from the provided snapshot.
+  Use carefully.
+
+- `ctx.brokerage.get_avg_cost_basis(asset_name) -> float`
+  Returns average cost basis of currently held units for that asset.
+  Important:
+  if there is no open position, this returns `0.0`, not `None`.
+  Do not write:
+  `if avg_cost is not None`
+  because that does not guard against no-position state.
+  Better:
+  `if current_units > 0 and avg_cost > 0:`
+
+- `ctx.brokerage.get_total_unrealized_pnl(market_snapshot) -> float`
+- `ctx.brokerage.get_total_realized_pnl(market_snapshot) -> float`
+- `ctx.brokerage.get_realized_pnl_pct(market_snapshot) -> float`
+- `ctx.brokerage.get_unrealized_pnl_pct(market_snapshot) -> float`
+
+Safe position handling patterns:
+- Current units in the primary asset:
+  `current_units = int(ctx.brokerage.positions.get(ctx.asset_name, 0))`
+
+- Current units in SPXL:
+  `spxl_units = int(ctx.brokerage.positions.get("SPXL", 0))`
+
+- Safe buy pattern:
+  `units = int(ctx.brokerage.available_cash // current_price)`
+  `if units > 0:`
+  `    ctx.brokerage.execute(symbol, units, current_price, timestamp=timestamp)`
+
+- Safe sell pattern:
+  `units = int(ctx.brokerage.positions.get(symbol, 0))`
+  `if units > 0:`
+  `    ctx.brokerage.execute(symbol, -units, current_price, timestamp=timestamp)`
+
+Indicator API:
+`Indicators` is already available in the runtime. Do not import it. Just call it directly.
+
+Indicator methods and exact return shapes:
+
+1. `Indicators.sma(series, n) -> list[float | None]`
+- Returns a list aligned to `series`.
+- First `n - 1` values are `None`.
+- Current SMA is usually `Indicators.sma(series, n)[-1]`.
+
+2. `Indicators.ema(series, alpha) -> list[float]`
+- `alpha` is a smoothing factor in `(0, 1]`.
+- This is NOT the same as EMA window length.
+- Returns a full-length list.
+- Common bug: passing a window length as `alpha`. Do not do that.
+
+3. `Indicators.ema_window(n, series) -> float`
+- This returns a SINGLE FLOAT, not a list.
+- It computes the EMA over the last `n` values.
+- It raises `ValueError` if `len(series) < n`.
+- Common bug:
+  `Indicators.ema_window(9, closes)[-1]`
+  This is wrong because the return value is a float, not a list.
+  Correct:
+  `ema_fast = Indicators.ema_window(9, closes)`
+
+4. `Indicators.ema_area_between_curves(series, k_st, k_lt, lookback) -> float`
+- Returns a single float.
+- Raises `ValueError` if not enough history.
+- Useful for curve-separation or trend-strength type logic.
+
+5. `Indicators.rolling_std(series, n) -> list[float | None]`
+- List aligned to input.
+- First warmup values are `None`.
+
+6. `Indicators.bollinger_bands(series, n, num_std=2.0) -> (lower, middle, upper)`
+- Returns three aligned lists.
+- Each current band value is at `[-1]`.
+
+7. `Indicators.rsi(series, n=14) -> list[float | None]`
+- Returns aligned list.
+- Warmup period exists.
+- If the history is too short, current value may be `None`.
+- Always guard before using `[-1]`.
+
+8. `Indicators.true_range(highs, lows, closes) -> list[float]`
+- Full-length list.
+- Requires equal input lengths.
+
+9. `Indicators.atr(highs, lows, closes, n=14) -> list[float | None]`
+- Returns aligned list with warmup `None` values.
+- Requires equal input lengths.
+
+10. `Indicators.vwap(highs, lows, closes, volumes) -> list[float]`
+- Returns full-length cumulative VWAP series.
+- Primary-symbol raw bars are the normal source for highs/lows/closes/volumes.
+
+11. `Indicators.macd(series, fast=12, slow=26, signal=9) -> (macd_line, signal_line, histogram)`
+- Returns three full-length lists.
+- Current histogram is `histogram[-1]`.
+
+12. `Indicators.stochastic_oscillator(highs, lows, closes, k_period=14, d_period=3) -> (%K, %D)`
+- Returns two aligned lists.
+- Warmup `None` values are expected.
+
+13. `Indicators.williams_r(highs, lows, closes, n=14) -> list[float | None]`
+
+14. `Indicators.cci(highs, lows, closes, n=20) -> list[float | None]`
+
+15. `Indicators.mfi(highs, lows, closes, volumes, n=14) -> list[float | None]`
+
+16. `Indicators.obv(closes, volumes) -> list[float]`
+
+Indicator usage examples:
+- `sma20 = Indicators.sma(closes, 20)[-1]`
+- `rsi14 = Indicators.rsi(closes, 14)[-1]`
+- `ema_fast = Indicators.ema_window(9, closes)`
+- `ema_slow = Indicators.ema_window(21, closes)`
+- `lower, middle, upper = Indicators.bollinger_bands(closes, 20, 2.0)`
+- `macd_line, signal_line, histogram = Indicators.macd(closes)`
+- `atr14 = Indicators.atr(highs, lows, closes, 14)[-1]`
+
+Common bugs you must avoid:
+1. Using future data
+- Wrong:
+  `ctx.session_market[-1]`
+- Right:
+  `ctx.market[-1]`
+
+2. Treating `ctx.market` values as raw bars
+- Wrong:
+  `ctx.market[-1][ctx.asset_name]["c"]`
+- Right:
+  `ctx.market[-1][ctx.asset_name]`
+- Raw OHLCV for the primary symbol comes from `ctx.bar` / `ctx.bars`.
+
+3. Referencing symbols not loaded by the CLI
+- Wrong:
+  `row["VIXY"]` when `VIXY` was not requested in `--market-symbols`
+- This causes `KeyError`.
+
+4. Using `Indicators.ema_window(...)[-1]`
+- Wrong because `ema_window` returns a float.
+- Correct:
+  `ema_fast = Indicators.ema_window(9, closes)`
+
+5. Calling indicators before enough history exists
+- Wrong:
+  computing 200-period indicators when `len(ctx.market) < 200`
+- Wrong:
+  calling `ema_window(200, closes)` too early
+- Guard first:
+  `if len(closes) < 200: return`
+
+6. Forgetting warmup `None` values
+- Many list-returning indicators produce `None` during warmup.
+- Always guard:
+  `if value is None: return`
+
+7. Selling more than you hold
+- `execute(symbol, -units, price)` fails if `units` exceeds current position.
+- Always read positions first.
+
+8. Using `get_avg_cost_basis(...)` as if it returns `None`
+- It returns `0.0` when there is no open position.
+- Guard with current position and `avg_cost > 0`.
+
+9. Recomputing too much work on every minute
+- This function runs once per minute bar in the intended intraday workflow.
+- Avoid heavy nested loops over the full history on every call.
+- Prefer the smallest necessary lookback window when possible.
+- If exact full-history smoothing is not required, use a recent suffix with a reasonable warmup buffer.
+- If you use long indicators repeatedly, be aware of runtime cost.
+
+10. Trading on the wrong asset
+- `ctx.asset_name` is the primary symbol.
+- You may trade another loaded symbol, but then read its price from `ctx.market[-1][that_symbol]` and its current holdings from `ctx.brokerage.positions`.
+
+11. Assuming you can compute high/low/volume indicators for secondary symbols
+- In stdin strategy mode, raw OHLCV is only available for the primary symbol.
+- Secondary symbols only have close prices in `ctx.market`.
+
+12. Confusing bars with days
+- In this workflow, `len(ctx.market)` counts visible minute bars, not trading days.
+- A 200-bar warmup on minute data is 200 minutes, not 200 sessions.
+- Do not accidentally write intraday logic as if the input were daily candles.
+
+Performance guidance:
+- Keep the strategy simple and linear.
+- Do not use `while`.
+- Avoid expensive repeated full-history calculations unless necessary.
+- Short-circuit early:
+  if you do not have enough bars yet, return immediately.
+- Prefer:
+  `current_snapshot = ctx.market[-1]`
+  and reuse it.
+- Prefer:
+  `timestamp = ctx.bar["t"] if ctx.bar is not None else None`
+  once per call.
+- Only compute the series you actually use.
+- Be especially careful with 1-minute intraday runs because the function may be invoked hundreds of times per session.
+
+Good defensive template shape:
+- Decide whether you are working on:
+  - primary asset only
+  - primary asset as signal, secondary asset as execution
+  - long/flat
+  - long/short proxy switching
+- Guard for minimum required history.
+- Build only the necessary series.
+- Compute indicator values.
+- Return immediately if any required current indicator value is `None`.
+- Read current holdings.
+- If it is session end and your strategy should flatten, flatten and return.
+- Otherwise evaluate signal and execute only valid trades.
+
+Example defensive structure:
+def strategy(ctx):
+    if ctx.is_session_end:
+        timestamp = ctx.bar["t"] if ctx.bar is not None else None
+        current_units = int(ctx.brokerage.positions.get(ctx.asset_name, 0))
+        if current_units > 0:
+            current_price = float(ctx.market[-1][ctx.asset_name])
+            ctx.brokerage.execute(ctx.asset_name, -current_units, current_price, timestamp=timestamp)
+        return
+
+    closes = [float(row[ctx.asset_name]) for row in ctx.market]
+    if len(closes) < 20:
+        return
+
+    sma20 = Indicators.sma(closes, 20)[-1]
+    if sma20 is None:
+        return
+
+    current_price = float(ctx.market[-1][ctx.asset_name])
+    current_units = int(ctx.brokerage.positions.get(ctx.asset_name, 0))
+    timestamp = ctx.bar["t"] if ctx.bar is not None else None
+
+    if current_price > sma20 and current_units == 0:
+        units = min(10, int(ctx.brokerage.available_cash // current_price))
+        if units > 0:
+            ctx.brokerage.execute(ctx.asset_name, units, current_price, timestamp=timestamp)
+
+Design checklist before writing code:
+- What is the signal asset?
+- What is the tradable asset?
+- Which symbols must exist in `--market-symbols`?
+- What is the minimum history length required in bars?
+- Since this is intraday minute execution, does your warmup represent minutes or sessions?
+- Which indicators return lists vs scalars?
+- Do any indicator outputs need `None` guards?
+- Do you need to flatten at session end?
+- Are you rotating between mutually exclusive assets like `SPXL` and `SPXS`?
+- Are you checking available cash before buys?
+- Are you checking existing position size before sells?
+- Are you accidentally using future data?
+
+What you should optimize for:
+- correctness
+- safety
+- runtime efficiency
+- no lookahead bias
+- no invalid API usage
+- no unsupported Python features
+- clean intraday minute-by-minute logic
+
+Your task:
+- Write exactly one valid Python function: `def strategy(ctx): ...`
+- Use only the runtime objects and interfaces described above.
+- Use only symbols that the caller is expected to load in `--market-symbols`.
+- Make the strategy logically coherent and safe.
+- Avoid the common bugs listed above.
+- Output only Python code and nothing else.
