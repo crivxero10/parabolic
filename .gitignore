@@ -45,3 +45,4 @@ logging_config.json
 .env
 .env.*
 alpaca_bars.json
+.parabolic/

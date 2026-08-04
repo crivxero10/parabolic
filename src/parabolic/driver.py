@@ -8,6 +8,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
+from parabolic.agent_native import project_spec
 from parabolic.backtest import Backtester
 from parabolic.brokerage import Brokerage
 from parabolic.classifier import RegimeClassifier, RegimeClassifierConfig
@@ -833,6 +834,10 @@ def build_parser() -> argparse.ArgumentParser:
         "strategy-spec",
         help="Emit a machine-readable JSON specification for strategy authors",
     )
+    subparsers.add_parser(
+        "agent-spec",
+        help="Emit the machine-readable contract for agent-native project work",
+    )
 
     evaluate_parser = subparsers.add_parser(
         "evaluate",
@@ -892,8 +897,9 @@ def main(
     logging_config = configure_logging()
     logger = logging.getLogger(__name__)
 
-    if args.command == "strategy-spec":
-        print(json.dumps(strategy_api_spec(), indent=2))
+    if args.command in {"strategy-spec", "agent-spec"}:
+        spec = strategy_api_spec() if args.command == "strategy-spec" else project_spec()
+        print(json.dumps(spec, indent=2))
         return 0
 
     if market_data_provider_override is None:

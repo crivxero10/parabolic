@@ -7,10 +7,11 @@ requires-python = ">=3.14"
 
 dependencies = [
     "pandas",
-    "numpy"
+    "numpy",
+    "requests",
+    "mcp>=1.27,<2"
 ]
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-

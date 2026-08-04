@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "facts": [
+    {
+      "id": "cli-commands",
+      "statement": "The public command boundary consists of tune, evaluate, strategy-spec, and agent-spec.",
+      "affected_components": ["cli", "agent-native-contracts"],
+      "provenance": {"kind": "source", "paths": ["src/parabolic/driver.py"]},
+      "confidence": "verified",
+      "valid_for": {"repository_revision": "97363ce15168cd5aa5f4674878fa025a8edf0568"}
+    },
+    {
+      "id": "market-data-boundary",
+      "statement": "Only the market-data component owns the Alpaca HTTP adapter; callers depend on MarketDataProvider.",
+      "affected_components": ["market-data", "cli", "backtesting"],
+      "provenance": {"kind": "source", "paths": ["src/parabolic/mdp.py", "src/parabolic/driver.py", "src/parabolic/backtest.py"]},
+      "confidence": "verified",
+      "valid_for": {"repository_revision": "97363ce15168cd5aa5f4674878fa025a8edf0568"}
+    },
+    {
+      "id": "stdin-strategy-safety",
+      "statement": "Stdin strategies are validated before execution and run in a constrained subprocess with structured failures.",
+      "affected_components": ["strategies", "cli"],
+      "provenance": {"kind": "source", "paths": ["src/parabolic/strategy_runtime.py"]},
+      "confidence": "verified",
+      "valid_for": {"repository_revision": "97363ce15168cd5aa5f4674878fa025a8edf0568"}
+    }
+  ],
+  "edges": [
+    {"from": "cli", "to": "market-data", "relation": "depends_on"},
+    {"from": "cli", "to": "backtesting", "relation": "depends_on"},
+    {"from": "cli", "to": "strategies", "relation": "depends_on"},
+    {"from": "cli", "to": "tuning", "relation": "depends_on"}
+  ]
+}

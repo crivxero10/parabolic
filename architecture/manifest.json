@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "purpose": "Machine-readable component boundaries for Parabolic.",
+  "components": [
+    {
+      "id": "cli",
+      "source_paths": ["src/parabolic/driver.py"],
+      "owns": ["argument parsing", "credential resolution", "command dispatch", "JSON summaries"],
+      "depends_on": ["market-data", "backtesting", "strategies", "tuning", "agent-native-contracts"],
+      "test_paths": ["tests/test_driver_cli.py", "tests/test_driver_strategy_api.py"]
+    },
+    {
+      "id": "market-data",
+      "source_paths": ["src/parabolic/mdp.py"],
+      "owns": ["market data provider protocol", "Alpaca adapter", "local data cache"],
+      "depends_on": [],
+      "test_paths": ["tests/test_mdp.py"]
+    },
+    {
+      "id": "backtesting",
+      "source_paths": ["src/parabolic/backtest.py", "src/parabolic/brokerage.py", "src/parabolic/orchestrator.py", "src/parabolic/risk.py"],
+      "owns": ["simulation", "orders and positions", "trading context", "risk metrics"],
+      "depends_on": ["market-data"],
+      "test_paths": ["tests/test_backtest.py", "tests/test_brokerage.py", "tests/test_orchestrator.py", "tests/test_risk.py"]
+    },
+    {
+      "id": "strategies",
+      "source_paths": ["src/parabolic/classifier.py", "src/parabolic/indicators.py", "src/parabolic/strategy_runtime.py"],
+      "owns": ["built-in regime strategy", "indicators", "guarded stdin strategy execution"],
+      "depends_on": ["backtesting"],
+      "test_paths": ["tests/test_classifier.py", "tests/test_indicators.py", "tests/test_strategy_runtime.py"]
+    },
+    {
+      "id": "tuning",
+      "source_paths": ["src/parabolic/tuner.py", "src/parabolic/vortex.py", "src/parabolic/walker.py"],
+      "owns": ["parameter search", "synthetic market generation", "walk-forward support"],
+      "depends_on": ["backtesting", "strategies"],
+      "test_paths": ["tests/test_vortex.py", "tests/test_walker.py"]
+    },
+    {
+      "id": "agent-native-contracts",
+      "source_paths": ["src/parabolic/agent_native.py", "architecture/manifest.json", "architecture/knowledge.json", "architecture/TASK_TEMPLATE.md"],
+      "owns": ["component manifest", "knowledge fact shape", "task packet contract", "verification evidence contract"],
+      "depends_on": [],
+      "test_paths": ["tests/test_agent_native.py"]
+    }
+  ]
+}
