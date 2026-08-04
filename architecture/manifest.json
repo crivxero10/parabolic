@@ -43,6 +43,13 @@
       "owns": ["component manifest", "knowledge fact shape", "task packet contract", "verification evidence contract"],
       "depends_on": [],
       "test_paths": ["tests/test_agent_native.py"]
+    },
+    {
+      "id": "run-platform",
+      "source_paths": ["src/parabolic/platform.py", "src/parabolic/mcp_server.py", "src/parabolic/web.py"],
+      "owns": ["durable run queue", "CLI worker adapter", "MCP tool adapter", "localhost run dashboard"],
+      "depends_on": ["agent-native-contracts", "cli"],
+      "test_paths": ["tests/test_platform.py"]
     }
   ]
 }

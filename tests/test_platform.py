@@ -31,6 +31,7 @@ class TestRunPlatform(unittest.TestCase):
             self.assertEqual(completed.status, "succeeded")
             self.assertEqual(completed.exit_code, 0)
             self.assertIn('"schema_version": 1', completed.stdout)
+            self.assertEqual(completed.result["schema_version"], 1)
 
     def test_cancel_only_applies_to_queued_work(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -40,3 +41,12 @@ class TestRunPlatform(unittest.TestCase):
             store.close()
 
             self.assertEqual(cancelled.status, "cancelled")
+
+    def test_metadata_is_durable_and_editable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            store = RunStore(Path(tempdir))
+            run = store.queue(["agent-spec"], None, ROOT, {"model": "gpt-5", "effort": "high"})
+            updated = store.update_metadata(run.run_id, {"model": "gpt-5", "effort": "medium"})
+            store.close()
+
+            self.assertEqual(updated.metadata, {"effort": "medium", "model": "gpt-5"})

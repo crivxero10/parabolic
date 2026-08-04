@@ -36,6 +36,17 @@ vector, for example `{"argv": ["agent-spec"]}` or an `evaluate`/`tune` argument
 vector. `--api-key` and `--api-secret` are rejected to keep secrets out of the
 SQLite queue.
 
+Each run stores agent-provided JSON metadata alongside its CLI output and parsed
+JSON result. Start the localhost dashboard with:
+
+```bash
+uv run python -m parabolic.platform web
+```
+
+It serves `http://127.0.0.1:8765` with a strategy-results table and CRUD API:
+`GET /api/runs`, `GET /api/runs/{run_id}`, `PATCH /api/runs/{run_id}` for metadata,
+and `DELETE /api/runs/{run_id}` for terminal records.
+
 ## Deferred Technical Debt
 
 - The worker uses a local SQLite database and a PID file; it is single-host and
@@ -47,3 +58,5 @@ SQLite queue.
   streamable HTTP, authentication, authorization, and an external secrets store.
 - The daemon currently validates command shape, not every CLI semantic. The
   existing CLI remains the authoritative validation boundary.
+- The dashboard is deliberately local-only and has no authentication. Do not
+  bind it to a network interface until access control is added.

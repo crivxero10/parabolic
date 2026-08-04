@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
 DEFAULT_STATE_DIR = Path(".parabolic/platform")
@@ -30,12 +30,14 @@ class Run:
     run_id: str
     argv: list[str]
     stdin_source: str | None
+    metadata: dict[str, object]
     status: str
     revision: str
     dirty: bool
     exit_code: int | None
     stdout: str
     stderr: str
+    result: dict[str, object] | None
 
 
 def state_dir_path(value: str | Path | None = None) -> Path:
@@ -65,20 +67,27 @@ class RunStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("""CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY, argv TEXT NOT NULL, stdin_source TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL, revision TEXT NOT NULL, dirty INTEGER NOT NULL,
-            exit_code INTEGER, stdout TEXT NOT NULL DEFAULT '', stderr TEXT NOT NULL DEFAULT ''
+            exit_code INTEGER, stdout TEXT NOT NULL DEFAULT '', stderr TEXT NOT NULL DEFAULT '', result TEXT
         )""")
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(runs)")}
+        if "metadata" not in columns:
+            self.connection.execute("ALTER TABLE runs ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+        if "result" not in columns:
+            self.connection.execute("ALTER TABLE runs ADD COLUMN result TEXT")
         self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
 
-    def queue(self, argv: Sequence[str], stdin_source: str | None, root: Path) -> Run:
+    def queue(self, argv: Sequence[str], stdin_source: str | None, root: Path, metadata: Mapping[str, object] | None = None) -> Run:
         revision, dirty = repository_snapshot(root)
-        run = Run(uuid.uuid4().hex, validate_cli_argv(argv), stdin_source, "queued", revision, dirty, None, "", "")
+        normalized_metadata = json.loads(json.dumps(metadata or {}, sort_keys=True))
+        run = Run(uuid.uuid4().hex, validate_cli_argv(argv), stdin_source, normalized_metadata, "queued", revision, dirty, None, "", "", None)
         self.connection.execute(
-            "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (run.run_id, json.dumps(run.argv), run.stdin_source, run.status, run.revision, run.dirty, None, "", ""),
+            "INSERT INTO runs (run_id, argv, stdin_source, metadata, status, revision, dirty, exit_code, stdout, stderr, result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run.run_id, json.dumps(run.argv), run.stdin_source, json.dumps(run.metadata, sort_keys=True), run.status, run.revision, run.dirty, None, "", "", None),
         )
         self.connection.commit()
         return run
@@ -103,8 +112,23 @@ class RunStore:
 
     def finish(self, run_id: str, exit_code: int, stdout: str, stderr: str) -> None:
         status = "succeeded" if exit_code == 0 else "failed"
-        self.connection.execute("UPDATE runs SET status=?, exit_code=?, stdout=?, stderr=? WHERE run_id=?", (status, exit_code, stdout, stderr, run_id))
+        try:
+            result = json.loads(stdout)
+        except json.JSONDecodeError:
+            result = None
+        self.connection.execute("UPDATE runs SET status=?, exit_code=?, stdout=?, stderr=?, result=? WHERE run_id=?", (status, exit_code, stdout, stderr, json.dumps(result, sort_keys=True) if isinstance(result, dict) else None, run_id))
         self.connection.commit()
+
+    def update_metadata(self, run_id: str, metadata: Mapping[str, object]) -> Run | None:
+        normalized = json.dumps(metadata, sort_keys=True)
+        self.connection.execute("UPDATE runs SET metadata=? WHERE run_id=?", (normalized, run_id))
+        self.connection.commit()
+        return self.get(run_id)
+
+    def delete(self, run_id: str) -> bool:
+        cursor = self.connection.execute("DELETE FROM runs WHERE run_id=? AND status IN ('succeeded', 'failed', 'cancelled')", (run_id,))
+        self.connection.commit()
+        return cursor.rowcount == 1
 
     def cancel(self, run_id: str) -> Run | None:
         self.connection.execute("UPDATE runs SET status='cancelled' WHERE run_id=? AND status='queued'", (run_id,))
@@ -113,7 +137,8 @@ class RunStore:
 
     @staticmethod
     def _to_run(row: sqlite3.Row) -> Run:
-        return Run(row["run_id"], json.loads(row["argv"]), row["stdin_source"], row["status"], row["revision"], bool(row["dirty"]), row["exit_code"], row["stdout"], row["stderr"])
+        result = json.loads(row["result"]) if row["result"] else None
+        return Run(row["run_id"], json.loads(row["argv"]), row["stdin_source"], json.loads(row["metadata"]), row["status"], row["revision"], bool(row["dirty"]), row["exit_code"], row["stdout"], row["stderr"], result)
 
 
 def run_once(state_dir: Path, root: Path) -> Run | None:
@@ -166,7 +191,7 @@ def stop_worker(state_dir: Path) -> bool:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Parabolic agent-run platform")
-    parser.add_argument("command", choices=["start", "stop", "status", "worker", "run-once"])
+    parser.add_argument("command", choices=["start", "stop", "status", "worker", "run-once", "web"])
     parser.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
     parser.add_argument("--root", default=str(Path.cwd()))
     args = parser.parse_args(argv)
@@ -179,6 +204,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"running": worker_running(state_dir), "state_dir": str(state_dir)}))
     elif args.command == "worker":
         worker(state_dir, root)
+    elif args.command == "web":
+        from parabolic.web import serve
+        serve(state_dir)
     else:
         run = run_once(state_dir, root)
         print(json.dumps(asdict(run) if run else {"status": "idle"}))

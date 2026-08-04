@@ -34,7 +34,8 @@ uv run python -m parabolic.platform stop
 
 1. Call `get_platform_spec` before an unfamiliar task to read the component and
    evidence contract.
-2. Call `queue_run` with an argument vector for a public CLI command.
+2. Call `queue_run` with an argument vector for a public CLI command and a
+   JSON metadata object describing the agent/model/effort that produced it.
 3. Save the returned `run_id` and `revision`; they are the durable correlation
    keys for the request.
 4. Poll `get_run(run_id)` until the status is `succeeded`, `failed`, or
@@ -55,6 +56,7 @@ name is the first item; do not include `python -m parabolic.driver`.
 
 ```json
 {
+  "metadata": {"agent_id": "research-7", "model": "gpt-5", "effort": "high"},
   "argv": [
     "evaluate", "--symbol", "SPY", "--start", "2024-01-08", "--end", "2024-01-11",
     "--timeframe", "minute", "--strategy-name", "regime_classifier",

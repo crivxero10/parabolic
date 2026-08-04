@@ -27,14 +27,14 @@ def _store(state_dir: str | None) -> RunStore:
 
 
 @mcp.tool()
-def queue_run(argv: list[str], stdin_source: str | None = None, state_dir: str | None = None) -> dict[str, object]:
+def queue_run(argv: list[str], stdin_source: str | None = None, metadata: dict[str, object] | None = None, state_dir: str | None = None) -> dict[str, object]:
     """Queue any supported Parabolic CLI command; workers inherit existing Alpaca environment credentials."""
     directory = state_dir_path(state_dir) if state_dir else DEFAULT_STATE_DIR
     validate_cli_argv(argv)
     start_worker(directory, ROOT)
     store = _store(state_dir)
     try:
-        return asdict(store.queue(argv, stdin_source, ROOT))
+        return asdict(store.queue(argv, stdin_source, ROOT, metadata))
     finally:
         store.close()
 
