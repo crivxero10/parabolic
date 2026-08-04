@@ -45,6 +45,22 @@ uv run python -m parabolic.platform stop
 6. Use `cancel_run` only while a run is `queued`; running-process cancellation
    is not implemented yet.
 
+## Autonomous Strategy Runs
+
+Before creating, advancing, repairing, or reporting an autonomous four-iteration
+strategy run, read and follow
+[ORCHESTRATOR_AGENT_CONTRACT.md](/Users/crivero/Documents/parabolic/parabolic/docs/ORCHESTRATOR_AGENT_CONTRACT.md).
+That document is normative and includes the 30-minute schedule, latest 30 closed
+trading sessions, four-iteration state packet, model budgets, immutable archive,
+failure classification, and required completion report.
+
+An agent MUST NOT work around a missing control by directly editing SQLite,
+rewriting an archived strategy, deleting a terminal run, or claiming compliance
+from partial evidence. It MUST fail closed and report the missing control. The
+strategy-generation subset is defined in
+[ORCHESTRATOR_STRATEGY_AUTHORING.md](/Users/crivero/Documents/parabolic/parabolic/docs/ORCHESTRATOR_STRATEGY_AUTHORING.md)
+and MUST be treated as prompt instructions, not optional advice.
+
 ## Queueing Commands
 
 `queue_run` accepts every existing CLI command as an `argv` list. The command

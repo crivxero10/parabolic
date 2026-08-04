@@ -58,6 +58,7 @@ def configure_logging(config_path: Path = LOGGING_CONFIG_PATH) -> dict:
     root_logger.setLevel(level)
     for handler in list(root_logger.handlers):
         root_logger.removeHandler(handler)
+        handler.close()
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
     file_path.parent.mkdir(parents=True, exist_ok=True)

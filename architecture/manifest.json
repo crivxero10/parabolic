@@ -50,6 +50,13 @@
       "owns": ["durable run queue", "CLI worker adapter", "MCP tool adapter", "localhost run dashboard"],
       "depends_on": ["agent-native-contracts", "cli"],
       "test_paths": ["tests/test_platform.py"]
+    },
+    {
+      "id": "strategy-orchestrator",
+      "source_paths": ["src/parabolic/strategy_orchestrator.py", "docs/ORCHESTRATOR_AGENT_CONTRACT.md", "docs/ORCHESTRATOR_STRATEGY_AUTHORING.md", "docs/ORCHESTRATOR_DESIGN.md"],
+      "owns": ["run cadence", "bounded strategy prompts", "OpenRouter adapter", "strategy artifact repository", "autonomous-agent operating contract"],
+      "depends_on": ["run-platform", "strategies"],
+      "test_paths": ["tests/test_strategy_orchestrator.py"]
     }
   ]
 }

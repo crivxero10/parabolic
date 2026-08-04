@@ -6,6 +6,9 @@ with the queued arguments, so `evaluate`, `tune`, `strategy-spec`, and
 `agent-spec` retain their existing behavior.
 
 Agents should follow [AGENT_OPERATIONS.md](/Users/crivero/Documents/parabolic/parabolic/docs/AGENT_OPERATIONS.md) for the required MCP workflow.
+Autonomous strategy-generation agents and daemon maintainers must additionally
+follow the normative
+[ORCHESTRATOR_AGENT_CONTRACT.md](/Users/crivero/Documents/parabolic/parabolic/docs/ORCHESTRATOR_AGENT_CONTRACT.md).
 
 ## One Lifecycle Switch
 
@@ -46,6 +49,12 @@ uv run python -m parabolic.platform web
 It serves `http://127.0.0.1:8765` with a strategy-results table and CRUD API:
 `GET /api/runs`, `GET /api/runs/{run_id}`, `PATCH /api/runs/{run_id}` for metadata,
 and `DELETE /api/runs/{run_id}` for terminal records.
+
+The PATCH and DELETE routes are legacy platform capabilities, not permission to
+mutate autonomous-run evidence. Agents MUST NOT use them on canonical
+orchestrator runs. Immutable canonical records and separate human annotations are
+required before the dashboard can be considered compliant with the autonomous
+orchestrator contract.
 
 ## Deferred Technical Debt
 

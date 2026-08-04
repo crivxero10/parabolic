@@ -6,6 +6,7 @@ import multiprocessing
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from queue import Empty
 from typing import Any, Callable
 
 from parabolic.backtest import Backtester
@@ -346,33 +347,38 @@ def evaluate_strategy_source(
             "max_output_chars": runtime_config.max_captured_output_chars,
         },
     )
-    process.start()
-    process.join(runtime_config.timeout_seconds)
+    try:
+        process.start()
+        process.join(runtime_config.timeout_seconds)
 
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=1.0)
         if process.is_alive():
-            process.kill()
+            process.terminate()
             process.join(timeout=1.0)
-        return False, _build_error_payload(
-            error_type="StrategyTimeout",
-            message=f"Strategy execution exceeded {runtime_config.timeout_seconds} seconds",
-            phase="strategy_timeout",
-            max_output_chars=runtime_config.max_captured_output_chars,
-            context={"timeout_seconds": runtime_config.timeout_seconds},
-        ), 1
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1.0)
+            return False, _build_error_payload(
+                error_type="StrategyTimeout",
+                message=f"Strategy execution exceeded {runtime_config.timeout_seconds} seconds",
+                phase="strategy_timeout",
+                max_output_chars=runtime_config.max_captured_output_chars,
+                context={"timeout_seconds": runtime_config.timeout_seconds},
+            ), 1
 
-    if not queue.empty():
-        result = queue.get()
+        try:
+            result = queue.get(timeout=0.2)
+        except Empty:
+            return False, _build_error_payload(
+                error_type="StrategyRuntimeError",
+                message="Strategy subprocess exited without producing a result",
+                phase="strategy_runtime",
+                max_output_chars=runtime_config.max_captured_output_chars,
+                context={"exit_code": process.exitcode},
+            ), 1
+
         if result.get("ok"):
             return True, result["summary"], 0
         return False, result["error"], 1
-
-    return False, _build_error_payload(
-        error_type="StrategyRuntimeError",
-        message="Strategy subprocess exited without producing a result",
-        phase="strategy_runtime",
-        max_output_chars=runtime_config.max_captured_output_chars,
-        context={"exit_code": process.exitcode},
-    ), 1
+    finally:
+        queue.close()
+        queue.join_thread()
